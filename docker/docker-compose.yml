@@ -1,0 +1,83 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment: { ZOOKEEPER_CLIENT_PORT: 2181 }
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: nyc
+      POSTGRES_USER: nyc
+      POSTGRES_PASSWORD: nyc
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # << korrekt relativ zu docker/
+
+  adminer:
+    image: adminer
+    ports: ["8082:8080"]
+
+  producer:
+    image: python:3.12-slim
+    depends_on: [kafka]
+    working_dir: /app
+    environment:
+      BOOTSTRAP: kafka:29092
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_ROOT_USER_ACTION: ignore
+    volumes:
+      - ../:/app
+    command: bash -lc "
+      pip install --quiet --no-cache-dir pandas pyarrow confluent-kafka &&
+      python kafka/producer.py"
+
+  spark:
+    image: bitnami/spark:3.5.1
+    depends_on: [kafka, postgres]
+    environment:
+      SPARK_MODE: client
+      KAFKA: kafka:29092
+      PGURL: jdbc:postgresql://postgres:5432/nyc
+      PGUSR: nyc
+      PGPW: nyc
+      CHECKPOINT: /chk/taxi_pipe
+    volumes:
+      - ../:/app
+      - ./chk:/chk
+    command: >
+      spark-submit
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+      /app/spark/spark_stream.py
+
+  streamlit:
+    image: python:3.12-slim
+    depends_on: [postgres]
+    working_dir: /app
+    environment:
+      DB_URL: postgresql+psycopg2://nyc:nyc@postgres:5432/nyc   # << zurück auf 'postgres'
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_ROOT_USER_ACTION: ignore
+    volumes:
+      - ../:/app
+    command: bash -lc "
+      pip install --quiet --no-cache-dir streamlit sqlalchemy psycopg2-binary pandas &&
+      streamlit run streamlit/app.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - "8501:8501"
+
+volumes:
+  pgdata:
