@@ -1,64 +1,105 @@
+# spark_stream.py
 import os
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import *
+from pyspark.sql.functions import col, from_json, lit, coalesce, to_timestamp, to_utc_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, LongType
 
-# --- ENV oder Defaults ---
+PGURL  = os.getenv("PGURL", "jdbc:postgresql://postgres:5432/nyc")
+PGUSR  = os.getenv("PGUSR", "nyc")
+PGPW   = os.getenv("PGPW",  "nyc")
+CHECKPOINT = os.getenv("CHECKPOINT", "/chk/taxi_pipe")
 KAFKA = os.getenv("KAFKA", "kafka:29092")
-PGURL = os.getenv("PGURL", "jdbc:postgresql://postgres:5432/nyc")
-PGUSR = os.getenv("PGUSR", "nyc")
-PGPW  = os.getenv("PGPW", "nyc")
-PGTBL = os.getenv("PGTBL", "rides")
-CHK   = os.getenv("CHECKPOINT", "/chk/taxi_pipe")
+PGTBL = os.getenv("PGTBL", "public.rides")
 
-spark = (
-    SparkSession.builder
-    .appName("nyc-taxi-stream")
-    .config(
-        "spark.jars.packages",
-        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3"
-    )
-    .getOrCreate()
-)
+spark = (SparkSession.builder
+         .appName("taxi-pipe")
+         .getOrCreate())
 
+# Breites Schema: deckt gelbe & grüne Dateien ab
 schema = StructType([
     StructField("service_type", StringType()),
-    StructField("pickup_datetime", TimestampType()),
-    StructField("dropoff_datetime", TimestampType()),
+
+    # Zeitspalten (als String; Producer schickt Strings)
+    StructField("tpep_pickup_datetime",  StringType()),
+    StructField("tpep_dropoff_datetime", StringType()),
+    StructField("lpep_pickup_datetime",  StringType()),
+    StructField("lpep_dropoff_datetime", StringType()),
+
+    # Locations
+    StructField("PULocationID", IntegerType()),
+    StructField("DOLocationID", IntegerType()),
+
+    # Core-Metriken
     StructField("trip_distance", DoubleType()),
-    StructField("fare_amount", DoubleType()),
-    StructField("tip_amount", DoubleType()),
+    StructField("fare_amount",  DoubleType()),
+    StructField("tip_amount",   DoubleType()),
     StructField("total_amount", DoubleType()),
-    StructField("pu_loc", IntegerType()),
-    StructField("do_loc", IntegerType())
+
+    # Zusatzfelder
+    StructField("VendorID", IntegerType()),
+    StructField("trip_type", IntegerType()),       # green
+    StructField("passenger_count", IntegerType()),
+
+    # diverse weitere Felder möglich – ignorieren wir hier (Spark lässt sie unbeachtet)
 ])
 
 def read_topic(topic):
-    raw = (spark.readStream.format("kafka")
-           .option("kafka.bootstrap.servers", KAFKA)
-           .option("subscribe", topic)
-           .option("startingOffsets","earliest")
-           .load())
-    parsed = raw.select(from_json(col("value").cast("string"), schema).alias("d")).select("d.*")
-    clean = (parsed.dropna(subset=["pickup_datetime","fare_amount","trip_distance"])
-                  .filter((col("fare_amount") >= 0) & (col("trip_distance") >= 0)))
-    return clean
+    return (spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA)
+        .option("subscribe", topic)
+        .option("startingOffsets", "earliest")
+        .option("failOnDataLoss", "false")   # <<< NEU
+        .load()
+        .selectExpr("CAST(value AS STRING) AS json")
+        .select(from_json(col("json"), schema).alias("d"))
+        .select("d.*")
+        .withColumn("src_topic", lit(topic)))
 
 yellow = read_topic("taxi_yellow")
 green  = read_topic("taxi_green")
-clean  = yellow.unionByName(green)
+raw = yellow.unionByName(green, allowMissingColumns=True)
 
-def write_batch(df, epoch):
-    (df.write.format("jdbc")
-       .option("url", PGURL)
-       .option("dbtable", PGTBL)
-       .option("user", PGUSR).option("password", PGPW)
-       .option("driver", "org.postgresql.Driver")
-       .mode("append").save())
+# Pickup/Dropoff je nach Service wählen (yellow=tpep_*, green=lpep_*)
+pickup_local  = coalesce(col("tpep_pickup_datetime"),  col("lpep_pickup_datetime"))
+dropoff_local = coalesce(col("tpep_dropoff_datetime"), col("lpep_dropoff_datetime"))
 
-q = (clean.writeStream.outputMode("append")
-     .foreachBatch(write_batch)
-     .option("checkpointLocation", CHK)
-     .start())
+# Strings -> timestamp (lokal), dann nach UTC
+pickup_ts_local  = to_timestamp(pickup_local)   # interpretiert String ohne TZ als lokale Zeit
+dropoff_ts_local = to_timestamp(dropoff_local)
 
-q.awaitTermination()
+# NYC -> UTC
+pickup_utc  = to_utc_timestamp(pickup_ts_local,  "America/New_York")
+dropoff_utc = to_utc_timestamp(dropoff_ts_local, "America/New_York")
+
+df = (raw
+    .withColumn("pickup_datetime",  pickup_utc)
+    .withColumn("dropoff_datetime", dropoff_utc)
+    .withColumn("pu_loc", col("PULocationID"))
+    .withColumn("do_loc", col("DOLocationID"))
+    .withColumn("vendor_id", col("VendorID"))
+    # nur die für das Dashboard benötigten Spalten behalten
+    .select(
+        "service_type",
+        "pickup_datetime", "dropoff_datetime",
+        "trip_distance", "fare_amount", "tip_amount", "total_amount",
+        "pu_loc", "do_loc",
+        "vendor_id", "trip_type", "passenger_count",
+    )
+)
+
+pg_props = {"user": PGUSR, "password": PGPW, "driver": "org.postgresql.Driver"}
+
+def write_batch(batch_df, batch_id):
+    (batch_df
+        .write
+        .mode("append")
+        .jdbc(PGURL, PGTBL, properties=pg_props))
+
+query = (df.writeStream
+          .foreachBatch(write_batch)
+          .option("checkpointLocation", CHECKPOINT)
+          .outputMode("append")
+          .start())
+
+query.awaitTermination()

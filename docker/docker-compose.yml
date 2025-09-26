@@ -15,6 +15,40 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        # Warten bis der Broker wirklich erreichbar ist (max 30 Versuche)
+        for i in $(seq 1 30); do
+          if kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1; then
+            break
+          fi
+          echo "Warte auf Kafka... ($$i)"
+          sleep 2
+        done
+
+        # Topics idempotent anlegen
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic taxi_yellow --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic taxi_green  --partitions 1 --replication-factor 1
+
+        echo "Topics angelegt."
+
 
   postgres:
     image: postgres:16
@@ -25,7 +59,13 @@ services:
     ports: ["5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ../sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # << korrekt relativ zu docker/
+      - ../sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nyc -d nyc"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
 
   adminer:
     image: adminer
@@ -33,22 +73,42 @@ services:
 
   producer:
     image: python:3.12-slim
-    depends_on: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     working_dir: /app
     environment:
       BOOTSTRAP: kafka:29092
+      DATA_DIR: /app/data/parquet
+      RATE: "100"
+      DAY_GAP_SEC: "2"
+      START_YEAR: "0"
+      TOPIC_Y: taxi_yellow
+      TOPIC_G: taxi_green
+      PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_ROOT_USER_ACTION: ignore
     volumes:
       - ../:/app
-    command: bash -lc "
-      pip install --quiet --no-cache-dir pandas pyarrow confluent-kafka &&
-      python kafka/producer.py"
+    command: >
+      bash -lc "
+        pip install --no-cache-dir pandas pyarrow confluent-kafka &&
+        python kafka/producer.py
+      "
 
   spark:
     image: bitnami/spark:3.5.1
-    depends_on: [kafka, postgres]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     environment:
+      PGTBL: public.rides
       SPARK_MODE: client
       KAFKA: kafka:29092
       PGURL: jdbc:postgresql://postgres:5432/nyc
@@ -65,19 +125,26 @@ services:
 
   streamlit:
     image: python:3.12-slim
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
     working_dir: /app
     environment:
-      DB_URL: postgresql+psycopg2://nyc:nyc@postgres:5432/nyc   # << zurück auf 'postgres'
+      DB_URL: postgresql+psycopg2://nyc:nyc@postgres:5432/nyc
+      REFRESH_SEC: "10"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_ROOT_USER_ACTION: ignore
     volumes:
       - ../:/app
-    command: bash -lc "
-      pip install --quiet --no-cache-dir streamlit sqlalchemy psycopg2-binary pandas &&
-      streamlit run streamlit/app.py --server.port 8501 --server.address 0.0.0.0"
+    command:
+      - bash
+      - -lc
+      - |
+        pip install --no-cache-dir streamlit sqlalchemy psycopg2-binary pandas streamlit-autorefresh
+        streamlit run streamlit/app.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
+
 
 volumes:
   pgdata:
