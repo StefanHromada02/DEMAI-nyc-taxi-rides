@@ -95,7 +95,16 @@ ORDER BY service_type
 """
 svc_df = fetch_df(svc_sql, params)
 st.subheader("Yellow vs. Green")
-st.dataframe(svc_df, width="stretch")
+st.dataframe(
+    svc_df,
+    width="stretch",
+    column_config={
+        "service_type": st.column_config.TextColumn("Service"),
+        "rows":         st.column_config.NumberColumn("Zeilen", format="%,d"),
+        "avg_fare":     st.column_config.NumberColumn("Ø Fare ($)", format="%.2f"),
+        "avg_dist":     st.column_config.NumberColumn("Ø Distanz (mi)", format="%.2f"),
+    },
+)
 
 # -------------------- Zeitreihe pro Stunde --------------------
 ts_sql = """
@@ -125,20 +134,28 @@ st.markdown("---")
 # -------------------- Statisch: Hotspots & Anbieter --------------------
 st.header("Statisch (mit Datumsauswahl)")
 
+# >>> Hotspots mit Zonen-Namen
 hot_sql = """
 WITH base AS (
-  SELECT pickup_datetime, pu_loc, do_loc
-  FROM rides
-  WHERE pickup_datetime >= :start AND pickup_datetime < :end
-    AND service_type = ANY(:svc)
+  SELECT
+    r.pickup_datetime,
+    COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
+    COALESCE(zdo."Zone", 'ID '||r.do_loc::text) AS do_name
+  FROM rides r
+  LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
+  LEFT JOIN taxi_zones zdo ON zdo."LocationID" = r.do_loc
+  WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+    AND r.service_type = ANY(:svc)
 )
 SELECT
   date_trunc(:grain, pickup_datetime) AS period,
-  SUM(1) FILTER (WHERE pu_loc IS NOT NULL) AS pu_count,
-  SUM(1) FILTER (WHERE do_loc IS NOT NULL) AS do_count,
-  pu_loc, do_loc
+  COUNT(*) FILTER (WHERE pu_name IS NOT NULL) AS pu_count,
+  COUNT(*) FILTER (WHERE do_name IS NOT NULL) AS do_count,
+  pu_name,
+  do_name
 FROM base
-GROUP BY period, pu_loc, do_loc
+GROUP BY period, pu_name, do_name
+ORDER BY period;
 """
 hot_m = fetch_df(hot_sql, {**params, "grain": "month"})
 hot_y = fetch_df(hot_sql, {**params, "grain": "year"})
@@ -149,29 +166,68 @@ with col_m:
     if hot_m.empty:
         st.info("Keine Daten.")
     else:
-        top_pu = (hot_m.groupby(["period", "pu_loc"], as_index=False)["pu_count"].sum()
+        top_pu = (hot_m.groupby(["period", "pu_name"], as_index=False)["pu_count"].sum()
                   .sort_values(["period", "pu_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        top_do = (hot_m.groupby(["period", "do_loc"], as_index=False)["do_count"].sum()
+        top_do = (hot_m.groupby(["period", "do_name"], as_index=False)["do_count"].sum()
                   .sort_values(["period", "do_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        st.write("Top Abholgebiete (PU)"); st.dataframe(top_pu, width="stretch")
-        st.write("Top Zielgebiete (DO)");  st.dataframe(top_do, width="stretch")
+
+        st.write("Top Abholgebiete (PU)")
+        st.dataframe(
+            top_pu,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "pu_name":  st.column_config.TextColumn("Pickup-Zone"),
+                "pu_count": st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+        st.write("Top Zielgebiete (DO)")
+        st.dataframe(
+            top_do,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "do_name":  st.column_config.TextColumn("Dropoff-Zone"),
+                "do_count": st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+
 with col_y:
     st.subheader("Hotspots Start/Ende – jährlich")
     if hot_y.empty:
         st.info("Keine Daten.")
     else:
-        top_pu = (hot_y.groupby(["period", "pu_loc"], as_index=False)["pu_count"].sum()
+        top_pu = (hot_y.groupby(["period", "pu_name"], as_index=False)["pu_count"].sum()
                   .sort_values(["period", "pu_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        top_do = (hot_y.groupby(["period", "do_loc"], as_index=False)["do_count"].sum()
+        top_do = (hot_y.groupby(["period", "do_name"], as_index=False)["do_count"].sum()
                   .sort_values(["period", "do_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        st.write("Top Abholgebiete (PU)"); st.dataframe(top_pu, width="stretch")
-        st.write("Top Zielgebiete (DO)");  st.dataframe(top_do, width="stretch")
 
-# Hail vs App
+        st.write("Top Abholgebiete (PU)")
+        st.dataframe(
+            top_pu,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "pu_name":  st.column_config.TextColumn("Pickup-Zone"),
+                "pu_count": st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+        st.write("Top Zielgebiete (DO)")
+        st.dataframe(
+            top_do,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "do_name":  st.column_config.TextColumn("Dropoff-Zone"),
+                "do_count": st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+
+# Hail vs App (unverändert)
 hail_sql = """
 SELECT date_trunc(:grain, pickup_datetime) AS period,
        trip_type,
@@ -204,7 +260,7 @@ with col_y2:
         pv.columns = ["street_hail(1)", "app(2)"] if set(pv.columns) == {1, 2} else [f"type_{c}" for c in pv.columns]
         st.bar_chart(pv, width="stretch")
 
-# Vendor
+# Vendor (unverändert, aber formatiert)
 vendor_sql = """
 SELECT date_trunc(:grain, pickup_datetime) AS period,
        vendor_id, COUNT(*) AS rows
@@ -227,7 +283,15 @@ with col_m3:
         top_vendor = vend_m.groupby("period", as_index=False).apply(
             lambda g: g.nlargest(5, "rows")
         ).reset_index(drop=True)
-        st.dataframe(top_vendor, width="stretch")
+        st.dataframe(
+            top_vendor,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "vendor_id":st.column_config.NumberColumn("VendorID", format="%,d"),
+                "rows":     st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
 with col_y3:
     st.subheader("Anbieter (VendorID) – jährlich")
     if vend_y.empty:
@@ -236,21 +300,31 @@ with col_y3:
         top_vendor = vend_y.groupby("period", as_index=False).apply(
             lambda g: g.nlargest(5, "rows")
         ).reset_index(drop=True)
-        st.dataframe(top_vendor, width="stretch")
+        st.dataframe(
+            top_vendor,
+            width="stretch",
+            column_config={
+                "period":   st.column_config.DatetimeColumn("Periode"),
+                "vendor_id":st.column_config.NumberColumn("VendorID", format="%,d"),
+                "rows":     st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
 
 # -------------------- Dynamisch --------------------
 st.header("Dynamisch (je nach Tag & Tageszeit)")
 
+# >>> Rush mit Zonen-Namen
 rush_sql = """
 SELECT
-  EXTRACT(ISODOW FROM pickup_datetime)::int AS weekday,  -- 1=Mo ... 7=So
-  EXTRACT(HOUR   FROM pickup_datetime)::int AS hour,
-  pu_loc,
+  EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,  -- 1=Mo ... 7=So
+  EXTRACT(HOUR   FROM r.pickup_datetime)::int AS hour,
+  COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
   COUNT(*) AS rides
-FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
-  AND service_type = ANY(:svc)
-GROUP BY weekday, hour, pu_loc
+FROM rides r
+LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
+WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+  AND r.service_type = ANY(:svc)
+GROUP BY weekday, hour, pu_name
 ORDER BY weekday, hour, rides DESC
 """
 rush = fetch_df(rush_sql, params)
@@ -260,21 +334,48 @@ else:
     top_rush = rush.groupby(["weekday", "hour"], as_index=False).apply(
         lambda g: g.nlargest(5, "rides")
     ).reset_index(drop=True)
-    st.dataframe(top_rush, width="stretch")
+    st.dataframe(
+        top_rush,
+        width="stretch",
+        column_config={
+            "weekday": st.column_config.NumberColumn("Wochentag", format="%d"),
+            "hour":    st.column_config.NumberColumn("Stunde", format="%02d"),
+            "pu_name": st.column_config.TextColumn("Pickup-Zone"),
+            "rides":   st.column_config.NumberColumn("Fahrten", format="%,d"),
+        },
+    )
 
+# >>> Tip-Rate mit Qualitätsfilter + Zonen-Namen
 tip_sql = """
 SELECT
-  EXTRACT(ISODOW FROM pickup_datetime)::int AS weekday,
-  pu_loc,
-  AVG(CASE WHEN fare_amount>0 THEN tip_amount/fare_amount ELSE NULL END)*100.0 AS tip_pct
-FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
-  AND service_type = ANY(:svc)
-GROUP BY weekday, pu_loc
+  EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,
+  COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
+  AVG(
+    CASE
+      WHEN r.fare_amount >= 5
+       AND r.tip_amount >= 0
+       AND r.tip_amount <= r.fare_amount
+      THEN r.tip_amount / r.fare_amount
+      ELSE NULL
+    END
+  ) * 100.0 AS tip_pct
+FROM rides r
+LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
+WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+  AND r.service_type = ANY(:svc)
+GROUP BY weekday, pu_name
 ORDER BY weekday, tip_pct DESC
 """
 tip = fetch_df(tip_sql, params)
 if tip.empty:
     st.info("Keine Daten.")
 else:
-    st.dataframe(tip, width="stretch")
+    st.dataframe(
+        tip,
+        width="stretch",
+        column_config={
+            "weekday": st.column_config.NumberColumn("Wochentag", format="%d"),
+            "pu_name": st.column_config.TextColumn("Pickup-Zone"),
+            "tip_pct": st.column_config.NumberColumn("Tip (%)", format="%.2f %%"),
+        },
+    )

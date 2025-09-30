@@ -43,9 +43,9 @@ services:
 
         # Topics idempotent anlegen
         kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic taxi_yellow --partitions 1 --replication-factor 1
+          --topic taxi_yellow --partitions 6 --replication-factor 1
         kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic taxi_green  --partitions 1 --replication-factor 1
+          --topic taxi_green  --partitions 6 --replication-factor 1
 
         echo "Topics angelegt."
 
@@ -60,6 +60,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ../sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ../sql/taxi_zone_lookup.csv:/docker-entrypoint-initdb.d/taxi_zone_lookup.csv:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nyc -d nyc"]
       interval: 5s
@@ -82,9 +83,9 @@ services:
     environment:
       BOOTSTRAP: kafka:29092
       DATA_DIR: /app/data/parquet
-      RATE: "100"
-      DAY_GAP_SEC: "2"
-      START_YEAR: "0"
+      RATE: "0"
+      DAY_GAP_SEC: "0"
+      START_YEAR: "2025"
       TOPIC_Y: taxi_yellow
       TOPIC_G: taxi_green
       PYTHONUNBUFFERED: "1"

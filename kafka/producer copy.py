@@ -24,15 +24,13 @@ FILE_RE = re.compile(r"^(yellow|green)_tripdata_(\d{4})-(\d{2})\.parquet$", re.I
 def create_producer() -> Producer:
     return Producer({
         "bootstrap.servers": BOOTSTRAP,
-        "linger.ms": 5,                  # ein paar Millisekunden sammeln
-        "batch.size": 131072,            # ~128 KB
-        "compression.type": "zstd",      # bessere Kompression als lz4
-        "acks": "1",                     # schneller, reicht für Bulk
-        "enable.idempotence": False,     # Bulk-Ingest -> Durchsatz vor Duplikat-Schutz
-        "max.in.flight.requests.per.connection": 5,
-        "message.timeout.ms": 30000,
+        "linger.ms": 0,                       # drip feed → kein Bündeln
+        "enable.idempotence": True,
+        "max.in.flight.requests.per.connection": 1,
+        "compression.type": "lz4",
+        "acks": "all",
+        "message.timeout.ms": 15000,
     })
-
 
 def ensure_topics(bootstrap: str, topics: list[str]) -> None:
     admin = AdminClient({"bootstrap.servers": bootstrap})
@@ -101,7 +99,10 @@ def add_pickup_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate: int):
-    interval = None if rate <= 0 else 1.0 / rate
+    """
+    Sendet Records mit konstanter Rate (msgs/s). Ruft regelmäßig poll(), um IO zu pumpen.
+    """
+    interval = 1.0 / max(rate, 1)
     next_tick = time.perf_counter()
     sent = 0
     for rec in records:
@@ -113,17 +114,17 @@ def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate
             except BufferError:
                 producer.poll(0.05)
         sent += 1
-        producer.poll(0)
+        producer.poll(0)  # Delivery-Callbacks
 
-        if interval is not None:                    # <— nur dann drosseln
-            next_tick += interval
-            sleep = next_tick - time.perf_counter()
-            if sleep > 0:
-                time.sleep(sleep)
-            else:
-                next_tick = time.perf_counter()
+        # pacing
+        next_tick += interval
+        sleep = next_tick - time.perf_counter()
+        if sleep > 0:
+            time.sleep(sleep)
+        else:
+            next_tick = time.perf_counter()
+
     return sent
-
 
 def stream_month_by_day(path: Path, service: str, topic: str, rate: int, day_gap_sec: float, producer: Producer):
     """
