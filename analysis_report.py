@@ -37,38 +37,108 @@ def get_bounds(engine):
 
 
 # -------------------- Queries --------------------
+# KPI_SQL
+# Zweck: Gesamtkennzahlen über das gewählte Zeitfenster und die gewählten Services.
+# Rückgabe-Spalten:
+#   rows      : Anzahl Fahrten (COUNT *)
+#   avg_fare  : Ø Fahrpreis (auf 2 Dezimalstellen gerundet)
+#   avg_dist  : Ø Distanz in Meilen (auf 2 Dezimalstellen gerundet)
+#   revenue   : Gesamtumsatz (SUM total_amount, auf 2 Dezimalstellen gerundet)
+# Parameter:
+#   :start, :end  — Zeitfenster [inkl. start, exklusiv end]
+#   :svc          — Python-Liste[str], wird in Postgres als ANY(ARRAY) verwendet
 KPI_SQL = """
-SELECT COUNT(*) AS rows,
-       AVG(fare_amount)::numeric(10,2)   AS avg_fare,
-       AVG(trip_distance)::numeric(10,2) AS avg_dist,
-       SUM(total_amount)::numeric(12,2)  AS revenue
+SELECT
+  -- Anzahl Zeilen/Fahrten im Filter
+  COUNT(*) AS rows,
+
+  -- Durchschnittlicher Fahrpreis; ::numeric(10,2) rundet für saubere Ausgabe
+  AVG(fare_amount)::numeric(10,2)   AS avg_fare,
+
+  -- Durchschnittliche Distanz (Meilen), ebenfalls auf 2 Nachkommastellen
+  AVG(trip_distance)::numeric(10,2) AS avg_dist,
+
+  -- Gesamtumsatz über alle Fahrten (inkl. Zuschläge/Tip je nach total_amount-Definition)
+  SUM(total_amount)::numeric(12,2)  AS revenue
 FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
+WHERE
+  -- Halb-offenes Intervall: start inklusive, end exklusiv (robust für Tages-/Monatsgrenzen)
+  pickup_datetime >= :start
+  AND pickup_datetime <  :end
+
+  -- Filter auf Service-Typ(en), z. B. 'yellow', 'green'
   AND service_type = ANY(:svc)
 """
 
+# SVC_SQL
+# Zweck: Gegenüberstellung der Services (z. B. yellow vs. green) im Zeitfenster.
+# Rückgabe-Spalten (je service_type):
+#   rows, avg_fare, avg_dist (wie bei KPI_SQL, aber gruppiert nach service_type)
+# Sortierung:
+#   Alphabetisch nach service_type (für stabile Ausgabe)
 SVC_SQL = """
-SELECT service_type,
-       COUNT(*) AS rows,
-       AVG(fare_amount)::numeric(10,2)   AS avg_fare,
-       AVG(trip_distance)::numeric(10,2) AS avg_dist
+SELECT
+  service_type,
+
+  -- Fahrten je Service
+  COUNT(*) AS rows,
+
+  -- Ø Fahrpreis je Service
+  AVG(fare_amount)::numeric(10,2)   AS avg_fare,
+
+  -- Ø Distanz je Service
+  AVG(trip_distance)::numeric(10,2) AS avg_dist
 FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
+WHERE
+  pickup_datetime >= :start
+  AND pickup_datetime <  :end
   AND service_type = ANY(:svc)
-GROUP BY service_type
-ORDER BY service_type
+GROUP BY
+  service_type
+ORDER BY
+  service_type
 """
 
+
+# TS_SQL
+# Zweck: Zeitreihe der Fahrten pro Stunde, getrennt nach Service.
+# Rückgabe-Spalten:
+#   hr           : Stunde (auf volle Stunde getrimmt via date_trunc('hour', ...))
+#   service_type : Servicekategorie
+#   rows         : Anzahl Fahrten in dieser Stunde und diesem Service
+# Hinweis:
+#   Die Kombination (hr, service_type) ist die Gruppierung; ORDER BY hr für zeitliche Reihenfolge.
 TS_SQL = """
-SELECT date_trunc('hour', pickup_datetime) AS hr,
-       service_type, COUNT(*) AS rows
+SELECT
+  -- Stunde als Zeit-Bucket (z. B. 2024-05-01 13:00:00)
+  date_trunc('hour', pickup_datetime) AS hr,
+
+  service_type,
+
+  -- Fahrten in diesem Stunden-Bucket und Service
+  COUNT(*) AS rows
 FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
+WHERE
+  pickup_datetime >= :start
+  AND pickup_datetime <  :end
   AND service_type = ANY(:svc)
-GROUP BY hr, service_type
-ORDER BY hr
+GROUP BY
+  hr, service_type
+ORDER BY
+  hr
 """
 
+# HOT_SQL
+# Zweck: Pickup-/Dropoff-"Hotspots" je Periode (Monat/Jahr) ermitteln.
+# Vorgehen:
+#   1) base-CTE: mappt pu_loc/do_loc auf menschenlesbare Zonennamen (taxi_zones)."Zone".
+#      Fallback, falls nicht matchbar: 'ID <num>'.
+#   2) Aggregation über gewünschte Periodizität (date_trunc mit :grain = 'month'|'year').
+# Rückgabe-Spalten:
+#   period  : Startzeitpunkt der Periode (Monats-/Jahresbeginn)
+#   pu_count/do_count : Anzahl Fahrten mit bekannter PU/DO-Zone in der Periode
+#   pu_name/do_name   : Zonennamen
+# Hinweis: Der Plot nimmt immer die "letzte" Periode und zeigt dort Top-10.
 HOT_SQL = """
 WITH base AS (
   SELECT
@@ -82,38 +152,56 @@ WITH base AS (
     AND r.service_type = ANY(:svc)
 )
 SELECT
-  date_trunc(:grain, pickup_datetime) AS period,
-  COUNT(*) FILTER (WHERE pu_name IS NOT NULL) AS pu_count,
-  COUNT(*) FILTER (WHERE do_name IS NOT NULL) AS do_count,
-  pu_name, do_name
+  date_trunc(:grain, pickup_datetime) AS period,          -- z. B. 2024-05-01 00:00:00
+  COUNT(*) FILTER (WHERE pu_name IS NOT NULL) AS pu_count, -- Anzahl Pickups in der Periode
+  COUNT(*) FILTER (WHERE do_name IS NOT NULL) AS do_count, -- Anzahl Dropoffs in der Periode
+  pu_name,
+  do_name
 FROM base
 GROUP BY period, pu_name, do_name
 ORDER BY period
 """
 
+# HAIL_SQL
+# Zweck: Verteilung Street-hail vs. App (trip_type) pro Periode (Monat/Jahr).
+# Voraussetzung: Spalte rides.trip_type ist befüllt (sonst empty).
+# Rückgabe-Spalten: period, trip_type, rows
 HAIL_SQL = """
-SELECT date_trunc(:grain, pickup_datetime) AS period,
-       trip_type,
-       COUNT(*) AS rows
+SELECT
+  date_trunc(:grain, pickup_datetime) AS period,
+  trip_type,
+  COUNT(*) AS rows
 FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
+WHERE
+  pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
   AND trip_type IS NOT NULL
 GROUP BY period, trip_type
 ORDER BY period
 """
 
+# VENDOR_SQL
+# Zweck: Anzahl Fahrten pro VendorID je Periode (Monat/Jahr).
+# Im Plot wird aus der "letzten" Periode Top 5 angezeigt.
+# Rückgabe-Spalten: period, vendor_id, rows
 VENDOR_SQL = """
-SELECT date_trunc(:grain, pickup_datetime) AS period,
-       vendor_id, COUNT(*) AS rows
+SELECT
+  date_trunc(:grain, pickup_datetime) AS period,
+  vendor_id,
+  COUNT(*) AS rows
 FROM rides
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
+WHERE
+  pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
   AND vendor_id IS NOT NULL
 GROUP BY period, vendor_id
 ORDER BY period, rows DESC
 """
 
+# RUSH_SQL
+# Zweck: Basis für Heatmap „Fahrten nach Wochentag × Stunde“.
+# Rückgabe-Spalten: weekday (1..7, ISO), hour (0..23), pu_name, rides
+# Hinweis: pu_name wird nicht geplottet, ist aber für ggf. spätere Segmentierungen vorhanden.
 RUSH_SQL = """
 SELECT
   EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,
@@ -122,12 +210,19 @@ SELECT
   COUNT(*) AS rides
 FROM rides r
 LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
-WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+WHERE
+  r.pickup_datetime >= :start AND r.pickup_datetime < :end
   AND r.service_type = ANY(:svc)
 GROUP BY weekday, hour, pu_name
 ORDER BY weekday, hour, rides DESC
 """
 
+# TIP_SQL
+# Zweck: Durchschnittliche Trinkgeldquote (in %) pro Pickup-Zone über Wochentage.
+# Qualitätsfilter:
+#   - fare_amount >= 5 (sehr kleine Fahrten ignorieren)
+#   - 0 <= tip_amount <= fare_amount (offensichtliche Ausreißer ausschließen)
+# Rückgabe-Spalten: weekday, pu_name, tip_pct (Prozentwert)
 TIP_SQL = """
 SELECT
   EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,
@@ -143,7 +238,8 @@ SELECT
   ) * 100.0 AS tip_pct
 FROM rides r
 LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
-WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+WHERE
+  r.pickup_datetime >= :start AND r.pickup_datetime < :end
   AND r.service_type = ANY(:svc)
 GROUP BY weekday, pu_name
 ORDER BY weekday, tip_pct DESC
