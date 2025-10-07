@@ -7,6 +7,15 @@ import pyarrow.parquet as pq
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
+# --- NEU: Hilfsfunktionen für chronologisches Merge je Monat ---
+
+from typing import Iterator, List, Dict
+import heapq
+
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20000"))
+PRELOAD_BATCHES = int(os.getenv("PRELOAD_BATCHES", "2"))  # wie viele Batches je Service gleichzeitig im Merge sein dürfen
+
+
 BOOTSTRAP   = os.getenv("BOOTSTRAP", "kafka:29092")
 TOPIC_Y     = os.getenv("TOPIC_Y", "taxi_yellow")
 TOPIC_G     = os.getenv("TOPIC_G", "taxi_green")
@@ -160,30 +169,177 @@ def stream_month_by_day(path: Path, service: str, topic: str, rate: int, day_gap
     print(f"[{topic}] {path.name}: total {total_sent} gesendet (streaming).")
 
 
+
+
+def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Tuple[int, pd.DataFrame] | None:
+    """
+    Lädt genau EIN RowGroup/Batch (ab start_rowgroup), normalisiert & sortiert nach __pickup_ts.
+    Gibt (next_rowgroup_index, df_sorted) zurück oder None wenn keine RowGroups mehr.
+    """
+    pf = pq.ParquetFile(path)
+    # ParquetFile.iter_batches ignoriert rowgroups nicht direkt; wir nehmen hier iter_batches + Skip.
+    # Für stabile Performance lesen wir einfach 'BATCH_SIZE' Zeilen (unabhängig von RowGroups).
+    # -> Wir nutzen hier eine einfache Schleife mit .read_row_groups wäre exakter, aber pyarrow high-level reicht.
+    # Wir simulieren "ab start_rowgroup" über einen Zähler:
+    read = 0
+    rows_accum = 0
+    dfs: List[pd.DataFrame] = []
+    for batch in pf.iter_batches(batch_size=BATCH_SIZE):
+        if read < start_rowgroup:
+            read += 1
+            continue
+        df = batch.to_pandas()
+        df["service_type"] = service
+        df = normalize_datetimes_to_string(df)
+        df = add_pickup_column(df)              # __pickup_ts / __pickup_day
+        dfs.append(df)
+        rows_accum += len(df)
+        read += 1
+        break  # nur 1 "Batch" (ein Stück) laden
+
+    if not dfs:
+        return None
+
+    df_all = pd.concat(dfs, ignore_index=True)
+    df_all.sort_values("__pickup_ts", inplace=True)
+    # fürs Senden __pickup_day nicht nötig
+    df_all.drop(columns=["__pickup_day"], inplace=True)
+    return (read, df_all)
+
+def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | None) -> Iterator[dict]:
+    """
+    Liefert Records aus (yellow, green) global chronologisch.
+    Nutzt pro Service bis zu PRELOAD_BATCHES parallele, sortierte Teil-DataFrames.
+    """
+    # pro Service: Pointer auf nächsten zu ladenden "Batch-Index" und eine Liste geladener DataFrames + Positionszeiger
+    services = {
+        "yellow": {"path": y_path, "next_idx": 0, "buffers": []},  # buffers: List[dict(index:int, df:DataFrame)]
+        "green":  {"path": g_path, "next_idx": 0, "buffers": []},
+    }
+
+    # Min-Heap über alle aktuellen Zeilenköpfe: (timestamp, service_key, buf_idx, row_pos)
+    heap: List[Tuple[pd.Timestamp, str, int, int]] = []
+
+    def preload(service_key: str):
+        """Lädt bis PRELOAD_BATCHES Batches in den Puffer und pusht deren erstes Element in den Heap."""
+        svc = services[service_key]
+        pth = svc["path"]
+        if pth is None:
+            return
+        # Nachladen bis Limit erreicht oder keine Batches mehr
+        while len(svc["buffers"]) < PRELOAD_BATCHES:
+            nxt = load_sorted_batch(pth, service_key, svc["next_idx"])
+            if nxt is None:
+                break
+            svc["next_idx"], df_sorted = nxt
+            if df_sorted.empty:
+                continue
+            buf_idx = len(svc["buffers"])
+            svc["buffers"].append({"df": df_sorted, "pos": 0})
+            ts0 = pd.to_datetime(df_sorted.iloc[0]["__pickup_ts"])
+            heapq.heappush(heap, (ts0, service_key, buf_idx, 0))
+
+    # initiales Preload beider Services
+    preload("yellow")
+    preload("green")
+
+    while heap:
+        ts, skey, bidx, pos = heapq.heappop(heap)
+        buf = services[skey]["buffers"][bidx]
+        df = buf["df"]
+        row = df.iloc[pos].to_dict()
+        # Entferne helper-Spalten, behalte Originale (tpep/lpep bleiben als Strings – ok)
+        row.pop("__pickup_ts", None)
+        yield row
+
+        # nächsten Zeiger im selben Buffer
+        pos += 1
+        if pos < len(df):
+            # push nächste Zeile aus demselben Buffer
+            nxt_ts = pd.to_datetime(df.iloc[pos]["__pickup_ts"])
+            heapq.heappush(heap, (nxt_ts, skey, bidx, pos))
+            # Update Position
+            buf["pos"] = pos
+        else:
+            # Buffer ist leer -> entfernen & ggf. neuen Batch preladen
+            services[skey]["buffers"][bidx] = None  # mark as None
+            # Speicher aufräumen: alte None-Einträge weg
+            services[skey]["buffers"] = [b for b in services[skey]["buffers"] if b is not None]
+            # Neue Batches nachladen (hält PRELOAD_BATCHES)
+            preload(skey)
+
+def stream_month_pair_chronological(y_file: Path | None, g_file: Path | None,
+                                    prod_y: Producer, prod_g: Producer,
+                                    rate: int):
+    """
+    Sendet einen Monats-Slot: wenn y & g vorhanden -> interleaved chrono;
+    sonst die vorhandene Datei allein.
+    """
+    if y_file is None and g_file is None:
+        return
+    if y_file is None:
+        # nur green
+        for _ in stream_single_file(g_file, "green", TOPIC_G, rate, prod_g):
+            pass
+        return
+    if g_file is None:
+        # nur yellow
+        for _ in stream_single_file(y_file, "yellow", TOPIC_Y, rate, prod_y):
+            pass
+        return
+
+    # beide vorhanden: global chrono
+    sent_y = sent_g = 0
+    for rec in iter_records_chronological_two_files(y_file, g_file):
+        if rec.get("service_type") == "yellow":
+            sent_y += drip_send_rows(prod_y, TOPIC_Y, [rec], rate)
+        else:
+            sent_g += drip_send_rows(prod_g, TOPIC_G, [rec], rate)
+    prod_y.flush(); prod_g.flush()
+    print(f"[merge] {y_file.name} + {g_file.name} → sent yellow={sent_y}, green={sent_g}")
+
+def stream_single_file(path: Path, service: str, topic: str, rate: int, producer: Producer):
+    """Fallback: eine Datei allein, chronologisch innerhalb der Datei (batchweise sortiert)."""
+    yield from (stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, DAY_GAP_SEC, producer),)
+
+# --- NEU: main() – älteste Monate, pro Monat y+g zusammenführen ---
+
 def main():
     ensure_topics(BOOTSTRAP, [TOPIC_Y, TOPIC_G])
     files = find_month_files(DATA_DIR)
     if not files:
         raise SystemExit(f"Keine Parquet-Dateien in {DATA_DIR} gefunden.")
 
-    # genau EIN gelbes und EIN grünes File auswählen (ältestes pro Typ)
-    first_y = next((t for t in files if t[2] == "yellow"), None)
-    first_g = next((t for t in files if t[2] == "green"), None)
-    to_stream = [x for x in [first_y, first_g] if x]
+    # Map je (year,month) -> Pfade
+    by_ym: dict[Tuple[int,int], dict[str,Path]] = {}
+    for y, m, svc, p in files:
+        by_ym.setdefault((y, m), {})[svc] = p
 
-    print("Sende genau 1x yellow + 1x green (falls vorhanden):")
-    for y, m, svc, p in to_stream:
-        print(f"  {svc:6s} {y}-{m:02d}  {p.name}")
+    # Ältestes zuerst
+    months_sorted = sorted(by_ym.keys())
+
+    print("Sende chronologisch pro Monat (yellow+green gemerged, falls beide vorhanden):")
+    for (y, m) in months_sorted:
+        y_file = by_ym[(y, m)].get("yellow")
+        g_file = by_ym[(y, m)].get("green")
+        label = f"{y}-{m:02d}"
+        if y_file and g_file:
+            print(f"  {label}: merge {y_file.name}  +  {g_file.name}")
+        elif y_file:
+            print(f"  {label}: only {y_file.name}")
+        else:
+            print(f"  {label}: only {g_file.name}")
 
     prod_y = create_producer()
     prod_g = create_producer()
 
-    for (year, month, service, path) in to_stream:
-        topic    = TOPIC_Y if service == "yellow" else TOPIC_G
-        producer = prod_y   if service == "yellow" else prod_g
-        stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, DAY_GAP_SEC, producer)
+    for (y, m) in months_sorted:
+        y_file = by_ym[(y, m)].get("yellow")
+        g_file = by_ym[(y, m)].get("green")
+        stream_month_pair_chronological(y_file, g_file, prod_y, prod_g, RATE_MSGS_PER_SEC)
 
-    print("Fertig (je ein File pro Service).")
+    print("Fertig: alle Monate verarbeitet.")
+
 
 
 if __name__ == "__main__":
