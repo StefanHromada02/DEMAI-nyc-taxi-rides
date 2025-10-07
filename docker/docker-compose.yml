@@ -109,7 +109,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      PGTBL: public.rides
+      PGTBL_Y: public.rides_yellow    # <— neu
+      PGTBL_G: public.rides_green     # <— neu
       SPARK_MODE: client
       KAFKA: kafka:29092
       PGURL: jdbc:postgresql://postgres:5432/nyc

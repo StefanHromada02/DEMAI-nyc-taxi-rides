@@ -166,19 +166,25 @@ def main():
     if not files:
         raise SystemExit(f"Keine Parquet-Dateien in {DATA_DIR} gefunden.")
 
-    print("Gefundene Dateien (älteste zuerst):")
-    for y, m, svc, p in files:
+    # genau EIN gelbes und EIN grünes File auswählen (ältestes pro Typ)
+    first_y = next((t for t in files if t[2] == "yellow"), None)
+    first_g = next((t for t in files if t[2] == "green"), None)
+    to_stream = [x for x in [first_y, first_g] if x]
+
+    print("Sende genau 1x yellow + 1x green (falls vorhanden):")
+    for y, m, svc, p in to_stream:
         print(f"  {svc:6s} {y}-{m:02d}  {p.name}")
 
     prod_y = create_producer()
     prod_g = create_producer()
 
-    for (year, month, service, path) in files:
-        topic = TOPIC_Y if service == "yellow" else TOPIC_G
-        producer = prod_y if service == "yellow" else prod_g
+    for (year, month, service, path) in to_stream:
+        topic    = TOPIC_Y if service == "yellow" else TOPIC_G
+        producer = prod_y   if service == "yellow" else prod_g
         stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, DAY_GAP_SEC, producer)
 
-    print("Fertig (chronologisch, pro Tag).")
+    print("Fertig (je ein File pro Service).")
+
 
 if __name__ == "__main__":
     main()

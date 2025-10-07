@@ -1,4 +1,4 @@
-# app.py — Live-Update ohne Seiten-Reload + neue width-API
+# app.py — Live-Update ohne Seiten-Reload, ohne DB-View (UNION ALL in SQL)
 
 import os
 from datetime import datetime, timezone
@@ -46,10 +46,46 @@ def fetch_df(sql: str, params=None):
     with engine.begin() as conn:
         return pd.read_sql(text(sql), conn, params=params)
 
+# -------------------- UNION-Helper (ohne View) --------------------
+def base_union_sql(include_yellow: bool, include_green: bool) -> str:
+    """
+    Baut ein UNION ALL über rides_yellow/green und liefert identisches Schema
+    wie die alte 'rides'-Tabelle (inkl. literalem service_type).
+    """
+    parts = []
+    if include_yellow:
+        parts.append("""
+        SELECT
+          id,
+          'yellow'::text AS service_type,
+          pickup_datetime, dropoff_datetime, trip_distance,
+          fare_amount, tip_amount, total_amount,
+          pu_loc, do_loc, vendor_id,
+          NULL::int AS trip_type,
+          passenger_count
+        FROM rides_yellow
+        """)
+    if include_green:
+        parts.append("""
+        SELECT
+          id,
+          'green'::text AS service_type,
+          pickup_datetime, dropoff_datetime, trip_distance,
+          fare_amount, tip_amount, total_amount,
+          pu_loc, do_loc, vendor_id,
+          trip_type,
+          passenger_count
+        FROM rides_green
+        """)
+    # mindestens eine Source
+    return "\nUNION ALL\n".join(parts) if parts else "SELECT * FROM (SELECT NULL WHERE false) x"
+
 # -------------------- Sidebar-Filter --------------------
 with st.sidebar:
     st.header("Filter")
-    bounds = fetch_df("SELECT min(pickup_datetime) AS dmin, max(pickup_datetime) AS dmax FROM rides")
+    # Bounds brauchen UNION-Basis; initial beide Services annehmen
+    base_sql_bounds = base_union_sql(True, True)
+    bounds = fetch_df(f"WITH r AS ({base_sql_bounds}) SELECT min(pickup_datetime) AS dmin, max(pickup_datetime) AS dmax FROM r")
     dmin = (bounds["dmin"].iloc[0] or pd.Timestamp("today")).date()
     dmax = (bounds["dmax"].iloc[0] or pd.Timestamp("today")).date()
     start, end = st.date_input("Zeitraum", (dmin, dmax))
@@ -58,36 +94,46 @@ with st.sidebar:
     if not services:
         st.stop()
 
+incl_y = "yellow" in services
+incl_g = "green"  in services
+base_sql = base_union_sql(incl_y, incl_g)
+
 params = {
     "start": pd.Timestamp(start),
     "end": pd.Timestamp(end) + pd.Timedelta(days=1),
-    "svc": services,
+    "svc": services,  # psycopg2 wandelt Python-List -> PG-Array; ANY(:svc) funktioniert
 }
 
 # -------------------- KPIs --------------------
-kpi_sql = """
+kpi_sql = f"""
+WITH r AS (
+{base_sql}
+)
 SELECT COUNT(*) AS rows,
        AVG(fare_amount)::numeric(10,2)   AS avg_fare,
        AVG(trip_distance)::numeric(10,2) AS avg_dist,
        SUM(total_amount)::numeric(12,2)  AS revenue
-FROM rides
+FROM r
 WHERE pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
 """
 kpi = fetch_df(kpi_sql, params).iloc[0]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Datensätze in Postgres", f"{int(kpi['rows']):,}")
-c2.metric("Ø Fare ($)",  kpi["avg_fare"])
-c3.metric("Ø Distanz (mi)", kpi["avg_dist"])
-c4.metric("Umsatz ($)", kpi["revenue"])
+c2.metric("Ø Fare ($)",           kpi["avg_fare"])
+c3.metric("Ø Distanz (mi)",       kpi["avg_dist"])
+c4.metric("Umsatz ($)",           kpi["revenue"])
 
 # -------------------- Yellow vs. Green --------------------
-svc_sql = """
+svc_sql = f"""
+WITH r AS (
+{base_sql}
+)
 SELECT service_type,
        COUNT(*) AS rows,
-       AVG(fare_amount)::numeric(10,2) AS avg_fare,
+       AVG(fare_amount)::numeric(10,2)   AS avg_fare,
        AVG(trip_distance)::numeric(10,2) AS avg_dist
-FROM rides
+FROM r
 WHERE pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
 GROUP BY service_type
@@ -107,10 +153,13 @@ st.dataframe(
 )
 
 # -------------------- Zeitreihe pro Stunde --------------------
-ts_sql = """
+ts_sql = f"""
+WITH r AS (
+{base_sql}
+)
 SELECT date_trunc('hour', pickup_datetime) AS hr,
        service_type, COUNT(*) AS rows
-FROM rides
+FROM r
 WHERE pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
 GROUP BY hr, service_type
@@ -134,14 +183,15 @@ st.markdown("---")
 # -------------------- Statisch: Hotspots & Anbieter --------------------
 st.header("Statisch (mit Datumsauswahl)")
 
-# >>> Hotspots mit Zonen-Namen
-hot_sql = """
-WITH base AS (
+# Hotspots (mit Zonen-Namen)
+hot_sql = f"""
+WITH r AS ({base_sql}),
+base AS (
   SELECT
     r.pickup_datetime,
     COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
     COALESCE(zdo."Zone", 'ID '||r.do_loc::text) AS do_name
-  FROM rides r
+  FROM r
   LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
   LEFT JOIN taxi_zones zdo ON zdo."LocationID" = r.do_loc
   WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
@@ -227,12 +277,13 @@ with col_y:
             },
         )
 
-# Hail vs App (unverändert)
-hail_sql = """
+# Hail vs App
+hail_sql = f"""
+WITH r AS ({base_sql})
 SELECT date_trunc(:grain, pickup_datetime) AS period,
        trip_type,
        COUNT(*) AS rows
-FROM rides
+FROM r
 WHERE pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
   AND trip_type IS NOT NULL
@@ -260,11 +311,12 @@ with col_y2:
         pv.columns = ["street_hail(1)", "app(2)"] if set(pv.columns) == {1, 2} else [f"type_{c}" for c in pv.columns]
         st.bar_chart(pv, width="stretch")
 
-# Vendor (unverändert, aber formatiert)
-vendor_sql = """
+# Vendor
+vendor_sql = f"""
+WITH r AS ({base_sql})
 SELECT date_trunc(:grain, pickup_datetime) AS period,
        vendor_id, COUNT(*) AS rows
-FROM rides
+FROM r
 WHERE pickup_datetime >= :start AND pickup_datetime < :end
   AND service_type = ANY(:svc)
   AND vendor_id IS NOT NULL
@@ -287,9 +339,9 @@ with col_m3:
             top_vendor,
             width="stretch",
             column_config={
-                "period":   st.column_config.DatetimeColumn("Periode"),
-                "vendor_id":st.column_config.NumberColumn("VendorID", format="%,d"),
-                "rows":     st.column_config.NumberColumn("Fahrten", format="%,d"),
+                "period":    st.column_config.DatetimeColumn("Periode"),
+                "vendor_id": st.column_config.NumberColumn("VendorID", format="%,d"),
+                "rows":      st.column_config.NumberColumn("Fahrten", format="%,d"),
             },
         )
 with col_y3:
@@ -304,23 +356,24 @@ with col_y3:
             top_vendor,
             width="stretch",
             column_config={
-                "period":   st.column_config.DatetimeColumn("Periode"),
-                "vendor_id":st.column_config.NumberColumn("VendorID", format="%,d"),
-                "rows":     st.column_config.NumberColumn("Fahrten", format="%,d"),
+                "period":    st.column_config.DatetimeColumn("Periode"),
+                "vendor_id": st.column_config.NumberColumn("VendorID", format="%,d"),
+                "rows":      st.column_config.NumberColumn("Fahrten", format="%,d"),
             },
         )
 
 # -------------------- Dynamisch --------------------
 st.header("Dynamisch (je nach Tag & Tageszeit)")
 
-# >>> Rush mit Zonen-Namen
-rush_sql = """
+# Rush (Zonen-Namen)
+rush_sql = f"""
+WITH r AS ({base_sql})
 SELECT
   EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,  -- 1=Mo ... 7=So
   EXTRACT(HOUR   FROM r.pickup_datetime)::int AS hour,
   COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
   COUNT(*) AS rides
-FROM rides r
+FROM r
 LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
 WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
   AND r.service_type = ANY(:svc)
@@ -345,8 +398,9 @@ else:
         },
     )
 
-# >>> Tip-Rate mit Qualitätsfilter + Zonen-Namen
-tip_sql = """
+# Tip-Rate (Qualitätsfilter)
+tip_sql = f"""
+WITH r AS ({base_sql})
 SELECT
   EXTRACT(ISODOW FROM r.pickup_datetime)::int AS weekday,
   COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
@@ -359,7 +413,7 @@ SELECT
       ELSE NULL
     END
   ) * 100.0 AS tip_pct
-FROM rides r
+FROM r
 LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
 WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
   AND r.service_type = ANY(:svc)
