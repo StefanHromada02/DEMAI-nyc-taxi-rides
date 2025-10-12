@@ -53,3 +53,17 @@ CREATE TABLE IF NOT EXISTS taxi_zones (
 COPY taxi_zones ("LocationID","Borough","Zone","service_zone")
 FROM '/docker-entrypoint-initdb.d/taxi_zone_lookup.csv'
 WITH (FORMAT csv, HEADER true);
+
+CREATE TABLE IF NOT EXISTS public.ingest_stats (
+  batch_id      BIGINT,
+  service_type  TEXT,
+  rows_total    BIGINT,
+  rows_null_pickup BIGINT,
+  rows_null_dropoff BIGINT,
+  rows_inversed BIGINT,
+  rows_equal_ts BIGINT,
+  rows_dupes    BIGINT,
+  pickup_min    TIMESTAMP,
+  pickup_max    TIMESTAMP,
+  created_at    TIMESTAMP DEFAULT now()
+);
