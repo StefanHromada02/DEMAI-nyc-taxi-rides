@@ -1,0 +1,5 @@
+streamlit
+sqlalchemy
+psycopg2-binary
+pandas
+streamlit-autorefresh

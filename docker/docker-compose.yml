@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -21,31 +23,24 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
 
   kafka-init:
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka: { condition: service_healthy }
     command:
       - bash
       - -lc
       - >
         set -e;
         for i in $$(seq 1 30); do
-          if kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1; then
-            break;
-          fi;
-          echo "Warte auf Kafka... ($$i)";
-          sleep 2;
+          if kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1; then break; fi;
+          echo "Warte auf Kafka... ($$i)"; sleep 2;
         done;
-        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
-        --topic taxi_yellow --partitions 6 --replication-factor 1;
-        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
-        --topic taxi_green --partitions 6 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic taxi_yellow --partitions 6 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic taxi_green  --partitions 6 --replication-factor 1;
         echo "Topics angelegt."
-
-
 
   postgres:
     image: postgres:16
@@ -64,18 +59,20 @@ services:
       timeout: 3s
       retries: 20
       start_period: 20s
+    restart: unless-stopped
 
   adminer:
     image: adminer
     ports: ["8082:8080"]
+    restart: unless-stopped
 
   producer:
-    image: python:3.12-slim
+    build:
+      context: ..
+      dockerfile: docker/producer.Dockerfile
     depends_on:
-      kafka:
-        condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
     working_dir: /app
     environment:
       BOOTSTRAP: kafka:29092
@@ -85,68 +82,52 @@ services:
       START_YEAR: "2025"
       TOPIC_Y: taxi_yellow
       TOPIC_G: taxi_green
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PIP_ROOT_USER_ACTION: ignore
+    # Für DEV kannst du den Code weiterhin live mounten (optional):
     volumes:
       - ../:/app
-    command: >
-      bash -lc "
-        pip install --no-cache-dir pandas pyarrow confluent-kafka &&
-        python kafka/producer.py
-      "
+    restart: unless-stopped
 
-spark:
-  image: apache/spark:3.5.1-python3
-  depends_on:
-    kafka:
-      condition: service_healthy
-    kafka-init:
-      condition: service_completed_successfully
-    postgres:
-      condition: service_healthy
-  environment:
-    PGTBL_Y: public.rides_yellow
-    PGTBL_G: public.rides_green
-    KAFKA: kafka:29092
-    PGURL: jdbc:postgresql://postgres:5432/nyc
-    PGUSR: nyc
-    PGPW: nyc
-    CHECKPOINT: /chk/taxi_pipe
-  volumes:
-    - ../:/app
-    - ./chk:/chk
-  entrypoint: ["/opt/spark/bin/spark-submit"]
-  command:
-    - --conf
-    - spark.jars.ivy=/tmp/.ivy2
-    - --packages
-    - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
-    - /app/spark/spark_stream.py
-
+  spark:
+    image: apache/spark:3.5.1-python3
+    depends_on:
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    environment:
+      PGTBL_Y: public.rides_yellow
+      PGTBL_G: public.rides_green
+      KAFKA: kafka:29092
+      PGURL: jdbc:postgresql://postgres:5432/nyc
+      PGUSR: nyc
+      PGPW: nyc
+      CHECKPOINT: /chk/taxi_pipe
+    volumes:
+      - ../:/app
+      - ./chk:/chk
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+      - /app/spark/spark_stream.py
+    restart: unless-stopped
 
   streamlit:
-    image: python:3.12-slim
+    build:
+      context: ..
+      dockerfile: docker/streamlit.Dockerfile
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
     working_dir: /app
     environment:
       DB_URL: postgresql+psycopg2://nyc:nyc@postgres:5432/nyc
       REFRESH_SEC: "10"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PIP_ROOT_USER_ACTION: ignore
+    ports: ["8501:8501"]
+    # Optional live-code-mount für Dev:
     volumes:
       - ../:/app
-    command:
-      - bash
-      - -lc
-      - |
-        pip install --no-cache-dir streamlit sqlalchemy psycopg2-binary pandas streamlit-autorefresh
-        streamlit run streamlit/app.py --server.port 8501 --server.address 0.0.0.0
-    ports:
-      - "8501:8501"
-
+    restart: unless-stopped
 
 volumes:
   pgdata:
