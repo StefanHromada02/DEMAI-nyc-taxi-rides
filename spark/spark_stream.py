@@ -15,29 +15,32 @@ KAFKA = os.getenv("KAFKA", "kafka:29092")
 PGTBL_Y = os.getenv("PGTBL_Y", "public.rides_yellow")
 PGTBL_G = os.getenv("PGTBL_G", "public.rides_green")
 
+# NEU: geordnete Writes aktivierbar
+ORDERED_WRITES = os.getenv("ORDERED_WRITES", "1") == "1"
+# Optional: weniger Shuffles, wenn geordnet geschrieben wird
+SHUFFLE_PARTS = int(os.getenv("SPARK_SHUFFLE_PARTITIONS", "1" if ORDERED_WRITES else "200"))
+
 spark = (SparkSession.builder
          .appName("taxi-pipe")
          .getOrCreate())
 
-# Breites Schema: deckt gelb & grün ab
+# ggf. Shuffle-Partitionen anpassen
+spark.conf.set("spark.sql.shuffle.partitions", str(SHUFFLE_PARTS))
+
 schema = StructType([
     StructField("service_type", StringType()),
-    # Zeitspalten als String
     StructField("tpep_pickup_datetime",  StringType()),
     StructField("tpep_dropoff_datetime", StringType()),
     StructField("lpep_pickup_datetime",  StringType()),
     StructField("lpep_dropoff_datetime", StringType()),
-    # Locations
     StructField("PULocationID", IntegerType()),
     StructField("DOLocationID", IntegerType()),
-    # Kern-Metriken
     StructField("trip_distance", DoubleType()),
     StructField("fare_amount",  DoubleType()),
     StructField("tip_amount",   DoubleType()),
     StructField("total_amount", DoubleType()),
-    # Zusatz
     StructField("VendorID", IntegerType()),
-    StructField("trip_type", IntegerType()),       # nur green
+    StructField("trip_type", IntegerType()),
     StructField("passenger_count", IntegerType()),
 ])
 
@@ -58,8 +61,8 @@ yellow_raw = read_topic("taxi_yellow")
 green_raw  = read_topic("taxi_green")
 raw = yellow_raw.unionByName(green_raw, allowMissingColumns=True)
 
-# Timestamps: String -> Timestamp (lokal nach Format) -> UTC (NYC)
-fmt = "yyyy-MM-dd HH:mm:ss"  # ggf. anpassen
+# Strings -> Timestamp lokal -> UTC (NYC)
+fmt = "yyyy-MM-dd HH:mm:ss"
 pickup_str  = coalesce(col("tpep_pickup_datetime"),  col("lpep_pickup_datetime"))
 dropoff_str = coalesce(col("tpep_dropoff_datetime"), col("lpep_dropoff_datetime"))
 pickup_ts_local  = to_timestamp(pickup_str,  fmt)
@@ -71,7 +74,6 @@ df = (raw
     .withColumn("fare_amount",  spark_round(col("fare_amount"), 2))
     .withColumn("tip_amount",   spark_round(col("tip_amount"), 2))
     .withColumn("total_amount", spark_round(col("total_amount"), 2))
-    # service_type robust ableiten, falls nicht gesetzt
     .withColumn(
         "service_type",
         when(col("service_type").isNull(),
@@ -79,11 +81,9 @@ df = (raw
              .when(col("src_topic")=="taxi_green","green")
         ).otherwise(col("service_type"))
     )
-    # optionales Anzeigeformat, nur wenn du's brauchst
     .withColumn("pickup_day", date_format(col("pickup_datetime"), "yyyy-MM-dd"))
 )
 
-# Ziel-DataFrames je Tabelle (Spalten müssen zum Ziel-Schema passen!)
 df_yellow = (df.filter(col("service_type")=="yellow")
     .select(
         "pickup_datetime", "dropoff_datetime", "trip_distance",
@@ -101,7 +101,7 @@ df_green = (df.filter(col("service_type")=="green")
         col("PULocationID").alias("pu_loc"),
         col("DOLocationID").alias("do_loc"),
         col("VendorID").alias("vendor_id"),
-        "trip_type",       # existiert nur bei green
+        "trip_type",
         "passenger_count"
     ))
 
@@ -109,7 +109,11 @@ pg_props = {"user": PGUSR, "password": PGPW, "driver": "org.postgresql.Driver"}
 
 def write_to_pg(table):
     def _fn(batch_df, batch_id):
-        (batch_df
+        df_out = batch_df
+        if ORDERED_WRITES:
+            # Älteste zuerst im Batch; ein Writer für deterministischere Insert-Reihenfolge
+            df_out = df_out.orderBy(col("pickup_datetime").asc()).coalesce(1)
+        (df_out
             .write
             .mode("append")
             .jdbc(PGURL, table, properties=pg_props))
