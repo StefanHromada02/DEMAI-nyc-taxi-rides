@@ -27,27 +27,24 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint:
-      - /bin/bash
-      - -lc
     command:
-      - |
-        # Warten bis der Broker wirklich erreichbar ist (max 30 Versuche)
-        for i in $(seq 1 30); do
+      - bash
+      - -lc
+      - >
+        set -e;
+        for i in $$(seq 1 30); do
           if kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1; then
-            break
-          fi
-          echo "Warte auf Kafka... ($$i)"
-          sleep 2
-        done
-
-        # Topics idempotent anlegen
-        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic taxi_yellow --partitions 6 --replication-factor 1
-        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic taxi_green  --partitions 6 --replication-factor 1
-
+            break;
+          fi;
+          echo "Warte auf Kafka... ($$i)";
+          sleep 2;
+        done;
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+        --topic taxi_yellow --partitions 6 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+        --topic taxi_green --partitions 6 --replication-factor 1;
         echo "Topics angelegt."
+
 
 
   postgres:
@@ -99,31 +96,34 @@ services:
         python kafka/producer.py
       "
 
-  spark:
-    image: bitnami/spark:3.5.1
-    depends_on:
-      kafka:
-        condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-    environment:
-      PGTBL_Y: public.rides_yellow    # <— neu
-      PGTBL_G: public.rides_green     # <— neu
-      SPARK_MODE: client
-      KAFKA: kafka:29092
-      PGURL: jdbc:postgresql://postgres:5432/nyc
-      PGUSR: nyc
-      PGPW: nyc
-      CHECKPOINT: /chk/taxi_pipe
-    volumes:
-      - ../:/app
-      - ./chk:/chk
-    command: >
-      spark-submit
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
-      /app/spark/spark_stream.py
+spark:
+  image: apache/spark:3.5.1-python3
+  depends_on:
+    kafka:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
+  environment:
+    PGTBL_Y: public.rides_yellow
+    PGTBL_G: public.rides_green
+    KAFKA: kafka:29092
+    PGURL: jdbc:postgresql://postgres:5432/nyc
+    PGUSR: nyc
+    PGPW: nyc
+    CHECKPOINT: /chk/taxi_pipe
+  volumes:
+    - ../:/app
+    - ./chk:/chk
+  entrypoint: ["/opt/spark/bin/spark-submit"]
+  command:
+    - --conf
+    - spark.jars.ivy=/tmp/.ivy2
+    - --packages
+    - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+    - /app/spark/spark_stream.py
+
 
   streamlit:
     image: python:3.12-slim
