@@ -1,8 +1,8 @@
-# app.py — Live-Update mit laufender Fake-Uhr (Simulated Now), Pause/Play & Speed
+# app.py — Live-Update mit Fake-Uhr (Simulated Now) + tz-fixes
 
 import os
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo  # Python ≥3.9
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo  # py≥3.9
 
 import pandas as pd
 import streamlit as st
@@ -30,7 +30,6 @@ with st.sidebar:
 
 run_id = 0
 if auto:
-    # Script-ReRun alle X Sekunden (kein Browser-Reload, kein Flackern)
     run_id = st_autorefresh(interval=interval * 1000, key="soft_refresh")
 
 st.sidebar.caption(
@@ -48,17 +47,6 @@ def fetch_df(sql: str, params=None):
         return pd.read_sql(text(sql), conn, params=params)
 
 # -------------------- Helpers --------------------
-def ensure_utc(ts):
-    """tz-naive -> UTC lokalisiert; tz-aware -> nach UTC konvertiert"""
-    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
-        return None
-    return pd.to_datetime(ts, utc=True)
-
-def fmt(ts, tz="UTC"):
-    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
-        return "—"
-    return ensure_utc(ts).tz_convert(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S %Z")
-
 def base_union_sql(include_yellow: bool, include_green: bool) -> str:
     parts = []
     if include_yellow:
@@ -87,89 +75,59 @@ def base_union_sql(include_yellow: bool, include_green: bool) -> str:
         """)
     return "\nUNION ALL\n".join(parts) if parts else "SELECT * FROM (SELECT NULL WHERE false) x"
 
+def ensure_utc(ts):
+    """Make any timestamp tz-aware in UTC (localize naive, convert aware)."""
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return None
+    t = pd.to_datetime(ts, utc=True)  # if naive -> localize UTC; if aware -> convert to UTC
+    return t
+
+def fmt(ts, tz="UTC"):
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "—"
+    t = ensure_utc(ts).tz_convert(ZoneInfo(tz))
+    return t.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# -------------------- Fake-Clock (Simulated Now) --------------------
 @st.cache_data(ttl=_ttl(), show_spinner=False)
-def get_first_last_and_lastbatch():
-    """Liefert min/max pickup_datetime (über beide Tabellen) und letzten ingest_stats.created_at"""
-    sql = """
-    WITH all_rides AS (
-      SELECT pickup_datetime FROM public.rides_yellow
-      UNION ALL
-      SELECT pickup_datetime FROM public.rides_green
-    )
-    SELECT
-      (SELECT MIN(pickup_datetime) FROM all_rides) AS first_pickup,
-      (SELECT MAX(pickup_datetime) FROM all_rides) AS last_pickup,
-      (SELECT MAX(created_at)      FROM public.ingest_stats) AS last_batch_at
+def get_bounds_and_clock():
+    union_sql = base_union_sql(True, True)
+    sql = f"""
+      WITH r AS ({union_sql})
+      SELECT
+        MIN(pickup_datetime) AS dmin,
+        MAX(pickup_datetime) AS dmax,
+        (SELECT MAX(created_at) FROM public.ingest_stats) AS last_batch_at
+      FROM r
     """
     df = fetch_df(sql)
-    first_pick  = ensure_utc(df["first_pickup"].iloc[0])
-    last_pick   = ensure_utc(df["last_pickup"].iloc[0])
-    last_batch  = ensure_utc(df["last_batch_at"].iloc[0])
-    return first_pick, last_pick, last_batch
+    dmin = df["dmin"].iloc[0]
+    dmax = df["dmax"].iloc[0]
+    last_batch = df["last_batch_at"].iloc[0]
+    # normalize all to tz-aware UTC
+    return ensure_utc(dmin), ensure_utc(dmax), ensure_utc(dmax), ensure_utc(last_batch)
 
-# -------------------- Fake Time Simulation (laufend) --------------------
-# Session-State initialisieren
-if "sim_anchor_real" not in st.session_state:
-    st.session_state.sim_anchor_real = datetime.now(timezone.utc)   # Realzeit-Anker
-if "sim_anchor_fake" not in st.session_state:
-    st.session_state.sim_anchor_fake = None                         # Fakezeit-Anker
-if "sim_speed" not in st.session_state:
-    st.session_state.sim_speed = 1.0                                # 1x Geschwindigkeit
-if "sim_paused" not in st.session_state:
-    st.session_state.sim_paused = False
+first_all, last_all, sim_now_utc, last_batch_at_utc = get_bounds_and_clock()
 
-first_all, last_all, last_batch_at = get_first_last_and_lastbatch()
-
-# Initial: Fakezeit auf letztes pickup setzen
-if st.session_state.sim_anchor_fake is None:
-    st.session_state.sim_anchor_fake = last_all or datetime.now(timezone.utc)
-
-# Controls in der Sidebar
-with st.sidebar:
-    st.header("Simulation")
-    colA, colB = st.columns(2)
-    if colA.button("⏯ Pause/Play"):
-        st.session_state.sim_paused = not st.session_state.sim_paused
-        # Bei Pause den Fake-Anker so setzen, dass die Zeit stehen bleibt
-        st.session_state.sim_anchor_fake = (
-            st.session_state.sim_anchor_fake if st.session_state.sim_paused else
-            st.session_state.sim_anchor_fake  # (nichts tun – Anker bleibt, Realzeit-Anker aktualisieren)
-        )
-        st.session_state.sim_anchor_real = datetime.now(timezone.utc)
-    if colB.button("⟲ Reset → letzter Datensatz"):
-        st.session_state.sim_anchor_fake = last_all or datetime.now(timezone.utc)
-        st.session_state.sim_anchor_real = datetime.now(timezone.utc)
-        st.session_state.sim_paused = False
-
-    speed = st.selectbox("Geschwindigkeit", ["0.5×","1×","2×","10×","60×"], index=1)
-    st.session_state.sim_speed = float(speed.replace("×",""))
-
-# Simulated Now berechnen
-now_utc = datetime.now(timezone.utc)
-if st.session_state.sim_paused:
-    sim_now_utc = st.session_state.sim_anchor_fake
-else:
-    elapsed_real = now_utc - st.session_state.sim_anchor_real
-    sim_now_utc = st.session_state.sim_anchor_fake + elapsed_real * st.session_state.sim_speed
-
-# Anzeige der Fake-Zeit oben zentriert
+# Simulated Now zentral anzeigen
 cL, cMid, cR = st.columns([1,2,1])
 with cMid:
     st.markdown(
         f"""
-        <div style="text-align:center; line-height:1.2; margin-top:6px;">
+        <div style="text-align:center; line-height:1.2;">
           <div style="font-size:14px; color:#888;">Simulated Now</div>
           <div style="font-size:28px; font-weight:700;">{fmt(sim_now_utc, "UTC")}</div>
-          <div style="font-size:12px; color:#888;">{fmt(sim_now_utc, "America/New_York")}</div>
+          <div style="font-size:13px; color:#888;">{fmt(sim_now_utc, "America/New_York")}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# Latenz-Text
+# Latenz (letzter Batch vs SimNow) – jetzt sicher, beide UTC-aware
 latency_txt = "—"
-if sim_now_utc is not None and last_batch_at is not None:
-    latency_txt = str(sim_now_utc - last_batch_at)
+if sim_now_utc is not None and last_batch_at_utc is not None:
+    delta = sim_now_utc - last_batch_at_utc
+    latency_txt = str(delta)
 
 # -------------------- Sidebar-Filter --------------------
 with st.sidebar:
@@ -179,7 +137,7 @@ with st.sidebar:
     start, end = st.date_input("Zeitraum", (dmin, dmax))
     services = st.multiselect("Service", ["yellow", "green"], default=["yellow", "green"])
     smooth = st.checkbox("Glätten (Rolling 3)", value=False)
-    st.caption(f"Letzter Batch @ {fmt(last_batch_at, 'UTC')} • Latenz vs. SimNow: {latency_txt}")
+    st.caption(f"Letzter Batch @ {fmt(last_batch_at_utc, 'UTC')} • Latenz vs. SimNow: {latency_txt}")
     if not services:
         st.stop()
 
