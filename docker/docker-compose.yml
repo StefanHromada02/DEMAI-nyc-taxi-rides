@@ -100,7 +100,7 @@ services:
       "
 
   spark:
-    image: bitnami/spark:3.5.1
+    image: apache/spark:3.5.1
     depends_on:
       kafka:
         condition: service_healthy
