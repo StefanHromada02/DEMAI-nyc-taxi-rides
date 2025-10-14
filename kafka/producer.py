@@ -133,6 +133,11 @@ def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate
                 next_tick = time.perf_counter()
     return sent
 
+def normalize_trip_type(df: pd.DataFrame) -> pd.DataFrame:
+    if "trip_type" in df.columns:
+        # sauber auf Integer bringen (keine 1.0/2.0, keine "nan")
+        df["trip_type"] = pd.to_numeric(df["trip_type"], errors="coerce").astype("Int64")
+    return df
 
 def stream_month_by_day(path: Path, service: str, topic: str, rate: int, day_gap_sec: float, producer: Producer):
     """
@@ -149,6 +154,7 @@ def stream_month_by_day(path: Path, service: str, topic: str, rate: int, day_gap
         df = batch.to_pandas()
         df["service_type"] = service
         df = normalize_datetimes_to_string(df)
+        df = normalize_trip_type(df)
 
         # Pickup-Zeitspalte vereinheitlichen (tpep/lpep/…)
         df = add_pickup_column(df)  # liefert __pickup_ts / __pickup_day
@@ -191,6 +197,7 @@ def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Tuple[in
         df = batch.to_pandas()
         df["service_type"] = service
         df = normalize_datetimes_to_string(df)
+        df = normalize_trip_type(df)   # <— HINZU
         df = add_pickup_column(df)              # __pickup_ts / __pickup_day
         dfs.append(df)
         rows_accum += len(df)

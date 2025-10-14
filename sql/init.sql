@@ -1,4 +1,4 @@
--- init.sql
+-- Rides-Tabellen
 CREATE TABLE IF NOT EXISTS rides_yellow (
   id                bigserial PRIMARY KEY,
   pickup_datetime   timestamptz,
@@ -24,11 +24,11 @@ CREATE TABLE IF NOT EXISTS rides_green (
   pu_loc            int,
   do_loc            int,
   vendor_id         int,
-  trip_type         int,   -- green-spezifisch
+  trip_type         int,
   passenger_count   int
 );
 
--- Indizes (pro Tabelle)
+-- Indizes
 CREATE INDEX IF NOT EXISTS ix_rides_yellow_pickup ON rides_yellow(pickup_datetime);
 CREATE INDEX IF NOT EXISTS ix_rides_yellow_pu     ON rides_yellow(pu_loc);
 CREATE INDEX IF NOT EXISTS ix_rides_yellow_do     ON rides_yellow(do_loc);
@@ -39,8 +39,7 @@ CREATE INDEX IF NOT EXISTS ix_rides_green_pu      ON rides_green(pu_loc);
 CREATE INDEX IF NOT EXISTS ix_rides_green_do      ON rides_green(do_loc);
 CREATE INDEX IF NOT EXISTS ix_rides_green_vendor  ON rides_green(vendor_id);
 
-
--- NEU: Lookup-Tabelle
+-- Taxi-Zonen Lookup
 CREATE TABLE IF NOT EXISTS taxi_zones (
   "LocationID"   int PRIMARY KEY,
   "Borough"      text,
@@ -48,12 +47,11 @@ CREATE TABLE IF NOT EXISTS taxi_zones (
   "service_zone" text
 );
 
--- NEU: CSV importieren (läuft automatisch beim ersten DB-Start)
--- Pfad zeigt auf den gemounteten init-Ordner im Container:
 COPY taxi_zones ("LocationID","Borough","Zone","service_zone")
 FROM '/docker-entrypoint-initdb.d/taxi_zone_lookup.csv'
 WITH (FORMAT csv, HEADER true);
 
+-- Ingest-Stats
 CREATE TABLE IF NOT EXISTS public.ingest_stats (
   batch_id      BIGINT,
   service_type  TEXT,
@@ -67,3 +65,21 @@ CREATE TABLE IF NOT EXISTS public.ingest_stats (
   pickup_max    TIMESTAMP,
   created_at    TIMESTAMP DEFAULT now()
 );
+
+-- Vendor-Provider Lookup
+CREATE TABLE IF NOT EXISTS public.vendor_providers (
+  vendor_id   int PRIMARY KEY,
+  provider    text NOT NULL,
+  note        text
+);
+
+INSERT INTO public.vendor_providers (vendor_id, provider) VALUES
+  (1, 'Creative Mobile Technologies, LLC'),
+  (2, 'Curb Mobility, LLC'),
+  (6, 'Myle Technologies Inc'),
+  (7, 'Helix')
+ON CONFLICT (vendor_id) DO NOTHING;
+
+-- Optional (nur wenn Daten sauber sind):
+-- ALTER TABLE rides_yellow ADD CONSTRAINT fk_vendor_yellow FOREIGN KEY (vendor_id) REFERENCES public.vendor_providers(vendor_id);
+-- ALTER TABLE rides_green  ADD CONSTRAINT fk_vendor_green  FOREIGN KEY (vendor_id) REFERENCES public.vendor_providers(vendor_id);

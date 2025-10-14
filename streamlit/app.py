@@ -1,20 +1,21 @@
 # app.py — Live-Update mit laufender Fake-Uhr (Simulated Now), Pause/Play & Speed
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo  # Python ≥3.9
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
-from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+from streamlit_autorefresh import st_autorefresh
+import altair as alt
 
 st.set_page_config(page_title="Taxi Pipe – Dashboard", layout="wide")
 st.title("End-to-End: Kafka → Spark → Postgres → Streamlit")
 
 # -------------------- Config --------------------
 DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://nyc:nyc@postgres:5432/nyc")
-REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))  # via docker-compose steuerbar
+REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))
 
 @st.cache_resource
 def get_engine():
@@ -27,10 +28,12 @@ with st.sidebar:
     st.header("Live-Update")
     auto = st.toggle("Auto-Refresh", value=True)
     interval = st.slider("Intervall (Sek.)", 2, 30, REFRESH_SEC)
+    if st.button("Cache leeren"):
+        st.cache_data.clear()
+        st.experimental_rerun()
 
 run_id = 0
 if auto:
-    # Script-ReRun alle X Sekunden (kein Browser-Reload, kein Flackern)
     run_id = st_autorefresh(interval=interval * 1000, key="soft_refresh")
 
 st.sidebar.caption(
@@ -89,7 +92,6 @@ def base_union_sql(include_yellow: bool, include_green: bool) -> str:
 
 @st.cache_data(ttl=_ttl(), show_spinner=False)
 def get_first_last_and_lastbatch():
-    """Liefert min/max pickup_datetime (über beide Tabellen) und letzten ingest_stats.created_at"""
     sql = """
     WITH all_rides AS (
       SELECT pickup_datetime FROM public.rides_yellow
@@ -108,33 +110,25 @@ def get_first_last_and_lastbatch():
     return first_pick, last_pick, last_batch
 
 # -------------------- Fake Time Simulation (laufend) --------------------
-# Session-State initialisieren
 if "sim_anchor_real" not in st.session_state:
-    st.session_state.sim_anchor_real = datetime.now(timezone.utc)   # Realzeit-Anker
+    st.session_state.sim_anchor_real = datetime.now(timezone.utc)
 if "sim_anchor_fake" not in st.session_state:
-    st.session_state.sim_anchor_fake = None                         # Fakezeit-Anker
+    st.session_state.sim_anchor_fake = None
 if "sim_speed" not in st.session_state:
-    st.session_state.sim_speed = 1.0                                # 1x Geschwindigkeit
+    st.session_state.sim_speed = 1.0
 if "sim_paused" not in st.session_state:
     st.session_state.sim_paused = False
 
 first_all, last_all, last_batch_at = get_first_last_and_lastbatch()
 
-# Initial: Fakezeit auf letztes pickup setzen
 if st.session_state.sim_anchor_fake is None:
     st.session_state.sim_anchor_fake = last_all or datetime.now(timezone.utc)
 
-# Controls in der Sidebar
 with st.sidebar:
     st.header("Simulation")
     colA, colB = st.columns(2)
     if colA.button("⏯ Pause/Play"):
         st.session_state.sim_paused = not st.session_state.sim_paused
-        # Bei Pause den Fake-Anker so setzen, dass die Zeit stehen bleibt
-        st.session_state.sim_anchor_fake = (
-            st.session_state.sim_anchor_fake if st.session_state.sim_paused else
-            st.session_state.sim_anchor_fake  # (nichts tun – Anker bleibt, Realzeit-Anker aktualisieren)
-        )
         st.session_state.sim_anchor_real = datetime.now(timezone.utc)
     if colB.button("⟲ Reset → letzter Datensatz"):
         st.session_state.sim_anchor_fake = last_all or datetime.now(timezone.utc)
@@ -144,7 +138,6 @@ with st.sidebar:
     speed = st.selectbox("Geschwindigkeit", ["0.5×","1×","2×","10×","60×"], index=1)
     st.session_state.sim_speed = float(speed.replace("×",""))
 
-# Simulated Now berechnen
 now_utc = datetime.now(timezone.utc)
 if st.session_state.sim_paused:
     sim_now_utc = st.session_state.sim_anchor_fake
@@ -152,7 +145,6 @@ else:
     elapsed_real = now_utc - st.session_state.sim_anchor_real
     sim_now_utc = st.session_state.sim_anchor_fake + elapsed_real * st.session_state.sim_speed
 
-# Anzeige der Fake-Zeit oben zentriert
 cL, cMid, cR = st.columns([1,2,1])
 with cMid:
     st.markdown(
@@ -166,7 +158,6 @@ with cMid:
         unsafe_allow_html=True,
     )
 
-# Latenz-Text
 latency_txt = "—"
 if sim_now_utc is not None and last_batch_at is not None:
     latency_txt = str(sim_now_utc - last_batch_at)
@@ -190,7 +181,7 @@ base_sql = base_union_sql(incl_y, incl_g)
 params = {
     "start": pd.Timestamp(start, tz="UTC"),
     "end": pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1),
-    "svc": services,  # psycopg2 wandelt Python-List -> PG-Array; ANY(:svc) funktioniert
+    "svc": services,
 }
 
 # -------------------- KPIs --------------------
@@ -269,6 +260,28 @@ else:
 
 st.markdown("---")
 
+st.subheader("Heatmap: Wochentag × Stunde")
+if ts.empty:
+    st.info("Keine Daten im gewählten Zeitraum/Filter.")
+else:
+    ts_sum = ts.groupby("hr", as_index=False)["rows"].sum()
+    ts_sum["weekday"] = ts_sum["hr"].dt.weekday  # 0=Mo, 6=So
+    ts_sum["hour"] = ts_sum["hr"].dt.hour
+    wd_map = {0:"Mo",1:"Di",2:"Mi",3:"Do",4:"Fr",5:"Sa",6:"So"}
+    ts_sum["wd_name"] = ts_sum["weekday"].map(wd_map)
+
+    heat = alt.Chart(ts_sum).mark_rect().encode(
+        x=alt.X("hour:O", title="Stunde"),
+        y=alt.Y("wd_name:O", sort=["Mo","Di","Mi","Do","Fr","Sa","So"], title="Wochentag"),
+        color=alt.Color("rows:Q", title="Fahrten"),
+        tooltip=[alt.Tooltip("wd_name:N", title="Wochentag"),
+                 alt.Tooltip("hour:O", title="Stunde"),
+                 alt.Tooltip("rows:Q", title="Fahrten")]
+    ).properties(width="container", height=240)
+    st.altair_chart(heat, use_container_width=True)
+
+st.markdown("---")
+
 # -------------------- Statisch: Hotspots & Anbieter --------------------
 st.header("Statisch (mit Datumsauswahl)")
 
@@ -280,8 +293,8 @@ base AS (
     COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
     COALESCE(zdo."Zone", 'ID '||r.do_loc::text) AS do_name
   FROM r
-  LEFT JOIN taxi_zones zpu ON zpu."LocationID" = r.pu_loc
-  LEFT JOIN taxi_zones zdo ON zdo."LocationID" = r.do_loc
+  LEFT JOIN public.taxi_zones zpu ON zpu."LocationID" = r.pu_loc
+  LEFT JOIN public.taxi_zones zdo ON zdo."LocationID" = r.do_loc
   WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
     AND r.service_type = ANY(:svc)
 )
@@ -310,10 +323,8 @@ with col_m:
         top_do = (hot_m.groupby(["period", "do_name"], as_index=False)["do_count"].sum()
                   .sort_values(["period", "do_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        st.write("Top Abholgebiete (PU)")
-        st.dataframe(top_pu, width="stretch")
-        st.write("Top Zielgebiete (DO)")
-        st.dataframe(top_do, width="stretch")
+        st.write("Top Abholgebiete (PU)"); st.dataframe(top_pu, width="stretch")
+        st.write("Top Zielgebiete (DO)");  st.dataframe(top_do, width="stretch")
 
 with col_y:
     st.subheader("Hotspots Start/Ende – jährlich")
@@ -326,57 +337,86 @@ with col_y:
         top_do = (hot_y.groupby(["period", "do_name"], as_index=False)["do_count"].sum()
                   .sort_values(["period", "do_count"], ascending=[True, False])
                   .groupby("period").head(10))
-        st.write("Top Abholgebiete (PU)")
-        st.dataframe(top_pu, width="stretch")
-        st.write("Top Zielgebiete (DO)")
-        st.dataframe(top_do, width="stretch")
+        st.write("Top Abholgebiete (PU)"); st.dataframe(top_pu, width="stretch")
+        st.write("Top Zielgebiete (DO)");  st.dataframe(top_do, width="stretch")
 
 # Hail vs App
-hail_sql = f"""
-WITH r AS ({base_sql})
-SELECT date_trunc(:grain, pickup_datetime) AS period,
-       trip_type,
-       COUNT(*) AS rows
-FROM r
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
-  AND service_type = ANY(:svc)
-  AND trip_type IS NOT NULL
-GROUP BY period, trip_type
-ORDER BY period
-"""
-hail_m = fetch_df(hail_sql, {**params, "grain": "month"})
-hail_y = fetch_df(hail_sql, {**params, "grain": "year"})
-
+# Street-hail vs App (nur Green hat trip_type)
 col_m2, col_y2 = st.columns(2)
+
+def _hail_chart(grain: str):
+    hail_sql = f"""
+    SELECT
+      date_trunc(:grain, pickup_datetime) AS period,
+      CASE COALESCE(TRIM(trip_type::text),'')
+        WHEN '1' THEN 'street_hail'
+        WHEN '2' THEN 'app'
+        ELSE 'unknown'
+      END AS kind,
+      COUNT(*) AS rows
+    FROM public.rides_green
+    WHERE pickup_datetime >= :start AND pickup_datetime < :end
+      -- akzeptiert sowohl int als auch text:
+      AND COALESCE(TRIM(trip_type::text),'') IN ('1','2')
+    GROUP BY period, kind
+    ORDER BY period;
+    """
+    return fetch_df(hail_sql, {**params, "grain": grain})
+
+
 with col_m2:
     st.subheader("Street-hail vs App – monatlich")
-    if hail_m.empty:
-        st.info("Keine Daten/keine trip_type-Angaben.")
+    if "green" not in services:
+        st.info("Nur für Green verfügbar. Wähle den Service „green“ aus.")
     else:
-        pv = hail_m.pivot(index="period", columns="trip_type", values="rows").fillna(0)
-        pv.columns = ["street_hail(1)", "app(2)"] if set(pv.columns) == {1, 2} else [f"type_{c}" for c in pv.columns]
-        st.bar_chart(pv, width="stretch")
+        hm = _hail_chart("month")
+        if hm.empty:
+            st.info("Keine Daten/keine trip_type-Angaben im Zeitraum.")
+        else:
+            pv = hm.pivot(index="period", columns="kind", values="rows").fillna(0)
+            st.bar_chart(pv, width="stretch")
+
 with col_y2:
     st.subheader("Street-hail vs App – jährlich")
-    if hail_y.empty:
-        st.info("Keine Daten/keine trip_type-Angaben.")
+    if "green" not in services:
+        st.info("Nur für Green verfügbar. Wähle den Service „green“ aus.")
     else:
-        pv = hail_y.pivot(index="period", columns="trip_type", values="rows").fillna(0)
-        pv.columns = ["street_hail(1)", "app(2)"] if set(pv.columns) == {1, 2} else [f"type_{c}" for c in pv.columns]
-        st.bar_chart(pv, width="stretch")
+        hy = _hail_chart("year")
+        if hy.empty:
+            st.info("Keine Daten/keine trip_type-Angaben im Zeitraum.")
+        else:
+            pv = hy.pivot(index="period", columns="kind", values="rows").fillna(0)
+            st.bar_chart(pv, width="stretch")
 
-# Vendor
+
+# Vendor (mit Namen)
+# Vendor (mit Namen + ID, Top-5 je Periode in SQL)
 vendor_sql = f"""
-WITH r AS ({base_sql})
-SELECT date_trunc(:grain, pickup_datetime) AS period,
-       vendor_id, COUNT(*) AS rows
-FROM r
-WHERE pickup_datetime >= :start AND pickup_datetime < :end
-  AND service_type = ANY(:svc)
-  AND vendor_id IS NOT NULL
-GROUP BY period, vendor_id
-ORDER BY period, rows DESC
+WITH r AS ({base_sql}),
+agg AS (
+  SELECT
+    date_trunc(:grain, r.pickup_datetime)                          AS period,
+    r.vendor_id,
+    COALESCE(v.provider, 'Vendor '||r.vendor_id::text)             AS vendor_name,
+    COUNT(*)                                                       AS rows
+  FROM r
+  LEFT JOIN public.vendor_providers v ON v.vendor_id = r.vendor_id
+  WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+    AND r.service_type = ANY(:svc)
+    AND r.vendor_id IS NOT NULL
+  GROUP BY period, r.vendor_id, vendor_name
+),
+ranked AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY period ORDER BY rows DESC) AS rn
+  FROM agg
+)
+SELECT period, vendor_name, rows
+FROM ranked
+WHERE rn <= 5
+ORDER BY period, rows DESC;
 """
+
 vend_m = fetch_df(vendor_sql, {**params, "grain": "month"})
 vend_y = fetch_df(vendor_sql, {**params, "grain": "year"})
 
@@ -386,16 +426,83 @@ with col_m3:
     if vend_m.empty:
         st.info("Keine Daten.")
     else:
-        top_vendor = vend_m.groupby("period", as_index=False).apply(
-            lambda g: g.nlargest(5, "rows")
-        ).reset_index(drop=True)
-        st.dataframe(top_vendor, width="stretch")
+        # sorgt dafür, dass die ID-Spalte nicht „verschwindet“
+        st.dataframe(
+            vend_m, width="stretch",
+            column_config={
+                "period":      st.column_config.DatetimeColumn("Periode"),
+                "vendor_name": st.column_config.TextColumn("Anbieter"),
+                "rows":        st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+
 with col_y3:
     st.subheader("Anbieter (VendorID) – jährlich")
     if vend_y.empty:
         st.info("Keine Daten.")
     else:
-        top_vendor = vend_y.groupby("period", as_index=False).apply(
-            lambda g: g.nlargest(5, "rows")
-        ).reset_index(drop=True)
-        st.dataframe(top_vendor, width="stretch")
+        st.dataframe(
+            vend_m, width="stretch",
+            column_config={
+                "period":      st.column_config.DatetimeColumn("Periode"),
+                "vendor_name": st.column_config.TextColumn("Anbieter"),
+                "rows":        st.column_config.NumberColumn("Fahrten", format="%,d"),
+            },
+        )
+
+
+# (Optional) Diagnose: zeigt, welche vendor_id im Filterzeitraum vorkommt
+diag_sql = f"""
+WITH r AS ({base_sql})
+SELECT r.vendor_id,
+       COALESCE(v.provider, '— (kein Mapping)') AS provider,
+       COUNT(*) AS rows
+FROM r
+LEFT JOIN public.vendor_providers v ON v.vendor_id = r.vendor_id
+WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+  AND r.service_type = ANY(:svc)
+GROUP BY r.vendor_id, provider
+ORDER BY rows DESC;
+"""
+with st.expander("Vendor-Diagnose (Debug)"):
+    st.dataframe(fetch_df(diag_sql, params), use_container_width=True)
+
+# -------------------- OD-Heatmap --------------------
+st.subheader("Heatmap: Pickup-Zone × Dropoff-Zone (Top 20)")
+od_sql = f"""
+WITH r AS ({base_sql}),
+base AS (
+  SELECT
+    COALESCE(zpu."Zone", 'ID '||r.pu_loc::text) AS pu_name,
+    COALESCE(zdo."Zone", 'ID '||r.do_loc::text) AS do_name
+  FROM r
+  LEFT JOIN public.taxi_zones zpu ON zpu."LocationID" = r.pu_loc
+  LEFT JOIN public.taxi_zones zdo ON zdo."LocationID" = r.do_loc
+  WHERE r.pickup_datetime >= :start AND r.pickup_datetime < :end
+    AND r.service_type = ANY(:svc)
+)
+SELECT pu_name, do_name, COUNT(*) AS trips
+FROM base
+GROUP BY pu_name, do_name
+"""
+od = fetch_df(od_sql, params)
+
+if od.empty:
+    st.info("Keine OD-Daten im gewählten Zeitraum/Filter.")
+else:
+    N = st.slider("Top-N Zonen für OD-Heatmap", 5, 40, 20)
+    top_pu = (od.groupby("pu_name")["trips"].sum()
+                .sort_values(ascending=False).head(N).index)
+    top_do = (od.groupby("do_name")["trips"].sum()
+                .sort_values(ascending=False).head(N).index)
+    od_top = od[od["pu_name"].isin(top_pu) & od["do_name"].isin(top_do)]
+
+    heat_od = alt.Chart(od_top).mark_rect().encode(
+        x=alt.X("do_name:N", sort="-y", title="Dropoff-Zone"),
+        y=alt.Y("pu_name:N", sort="-x", title="Pickup-Zone"),
+        color=alt.Color("trips:Q", title="Fahrten"),
+        tooltip=[alt.Tooltip("pu_name:N", title="Pickup"),
+                 alt.Tooltip("do_name:N", title="Dropoff"),
+                 alt.Tooltip("trips:Q", title="Fahrten")]
+    ).properties(width="container", height=520)
+    st.altair_chart(heat_od, use_container_width=True)
