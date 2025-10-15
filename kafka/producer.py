@@ -7,23 +7,19 @@ import pyarrow.parquet as pq
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
-# --- NEU: Hilfsfunktionen für chronologisches Merge je Monat ---
-
 from typing import Iterator, List, Dict
 import heapq
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20000"))
 PRELOAD_BATCHES = int(os.getenv("PRELOAD_BATCHES", "2"))  # wie viele Batches je Service gleichzeitig im Merge sein dürfen
 
-
 BOOTSTRAP   = os.getenv("BOOTSTRAP", "kafka:29092")
 TOPIC_Y     = os.getenv("TOPIC_Y", "taxi_yellow")
 TOPIC_G     = os.getenv("TOPIC_G", "taxi_green")
 DATA_DIR    = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[1] / "data" / "parquet"))
 
-# Livestream-Feeling: Nachrichten/Sekunde & Pause zwischen Tagen
+# Livestream-Feeling: Nachrichten/Sekunde
 RATE_MSGS_PER_SEC = int(os.getenv("RATE", "100"))       # z.B. 100 = ~10ms Abstand
-DAY_GAP_SEC       = float(os.getenv("DAY_GAP_SEC", "2"))# kurze Pause nach jedem Tag
 
 # optional: ab Jahr starten (z.B. nur ab 2024)
 START_YEAR = int(os.getenv("START_YEAR", "0"))          # 0 = ignorieren
@@ -33,15 +29,14 @@ FILE_RE = re.compile(r"^(yellow|green)_tripdata_(\d{4})-(\d{2})\.parquet$", re.I
 def create_producer() -> Producer:
     return Producer({
         "bootstrap.servers": BOOTSTRAP,
-        "linger.ms": 5,                  # ein paar Millisekunden sammeln
+        "linger.ms": 5,
         "batch.size": 131072,            # ~128 KB
-        "compression.type": "zstd",      # bessere Kompression als lz4
-        "acks": "1",                     # schneller, reicht für Bulk
-        "enable.idempotence": False,     # Bulk-Ingest -> Durchsatz vor Duplikat-Schutz
+        "compression.type": "zstd",
+        "acks": "1",
+        "enable.idempotence": False,
         "max.in.flight.requests.per.connection": 5,
         "message.timeout.ms": 30000,
     })
-
 
 def ensure_topics(bootstrap: str, topics: list[str]) -> None:
     admin = AdminClient({"bootstrap.servers": bootstrap})
@@ -62,14 +57,14 @@ def find_month_files(base: Path) -> list[Tuple[int,int,str,Path]]:
     out = []
     for p in base.glob("*.parquet"):
         m = FILE_RE.match(p.name)
-        if not m: 
+        if not m:
             continue
         service, y, mth = m.group(1).lower(), int(m.group(2)), int(m.group(3))
         if START_YEAR and y < START_YEAR:
             continue
         out.append((y, mth, service, p))
     # Ältestes zuerst
-    out.sort(key=lambda t: (t[0], t[1], 0 if t[2]=="yellow" else 1))
+    out.sort(key=lambda t: (t[0], t[1], 0 if t[2] == "yellow" else 1))
     return out
 
 def normalize_datetimes_to_string(df: pd.DataFrame) -> pd.DataFrame:
@@ -88,25 +83,23 @@ def normalize_datetimes_to_string(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_pickup_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Vereinheitlicht pickup-Spalte für die Tageslogik.
+    Vereinheitlicht Pickup-Zeitspalte.
     Yellow: tpep_pickup_datetime, Green: lpep_pickup_datetime.
     Fallback: pickup_datetime, pickup.
     """
-    candidates = [c for c in df.columns]
     def pick(*names):
         for n in names:
             if n in df.columns:
                 return n
         return None
 
-    col = pick("tpep_pickup_datetime","lpep_pickup_datetime","pickup_datetime","pickup")
+    col = pick("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime", "pickup")
     if not col:
         raise ValueError("Keine Pickup-Datetime-Spalte gefunden.")
     df = df.copy()
     df["__pickup_ts"] = pd.to_datetime(df[col], errors="coerce", utc=False)
     df = df.dropna(subset=["__pickup_ts"])
     df = df.sort_values("__pickup_ts")
-    df["__pickup_day"] = df["__pickup_ts"].dt.date  # Python date
     return df
 
 def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate: int):
@@ -124,7 +117,7 @@ def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate
         sent += 1
         producer.poll(0)
 
-        if interval is not None:                    # <— nur dann drosseln
+        if interval is not None:
             next_tick += interval
             sleep = next_tick - time.perf_counter()
             if sleep > 0:
@@ -135,60 +128,42 @@ def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate
 
 def normalize_trip_type(df: pd.DataFrame) -> pd.DataFrame:
     if "trip_type" in df.columns:
-        # sauber auf Integer bringen (keine 1.0/2.0, keine "nan")
         df["trip_type"] = pd.to_numeric(df["trip_type"], errors="coerce").astype("Int64")
     return df
 
-def stream_month_by_day(path: Path, service: str, topic: str, rate: int, day_gap_sec: float, producer: Producer):
+def stream_month_by_day(path: Path, service: str, topic: str, rate: int, producer: Producer):
     """
     Speicher-schonend: liest Parquet in Batches und sendet innerhalb jedes Batches
-    die Datensätze tageweise in aufsteigender Reihenfolge (drip feed).
-    Kein Full-Load in den RAM.
+    chronologisch nach __pickup_ts (keine Tages-Pausen mehr).
     """
     print(f"[{topic}] Lade (streaming) {path.name} …")
     pf = pq.ParquetFile(path)
-    last_day = None
     total_sent = 0
 
-    for batch in pf.iter_batches(batch_size=20_000):  # ggf. 10_000 bei wenig RAM
+    for batch in pf.iter_batches(batch_size=20_000):
         df = batch.to_pandas()
         df["service_type"] = service
         df = normalize_datetimes_to_string(df)
         df = normalize_trip_type(df)
 
-        # Pickup-Zeitspalte vereinheitlichen (tpep/lpep/…)
-        df = add_pickup_column(df)  # liefert __pickup_ts / __pickup_day
+        # Pickup-Zeit vereinheitlichen + chronologisch sortieren
+        df = add_pickup_column(df)  # liefert __pickup_ts
+        records = df.drop(columns=["__pickup_ts"]).to_dict(orient="records")
 
-        # pro Batch tageweise senden (aufsteigend)
-        for d, df_day in df.sort_values("__pickup_day").groupby("__pickup_day", sort=True):
-            # Sleep nur beim Tagwechsel (nicht jedes Mal)
-            if last_day is not None and d != last_day and day_gap_sec > 0:
-                time.sleep(day_gap_sec)
-            last_day = d
-
-            records = df_day.drop(columns=["__pickup_day"]).to_dict(orient="records")
-            sent = drip_send_rows(producer, topic, records, rate)
-            total_sent += sent
-            print(f"[{topic}] {path.name} – {d}: +{sent} (Σ {total_sent})")
+        sent = drip_send_rows(producer, topic, records, rate)
+        total_sent += sent
+        print(f"[{topic}] {path.name}: +{sent} (Σ {total_sent})")
 
     producer.flush()
     print(f"[{topic}] {path.name}: total {total_sent} gesendet (streaming).")
 
-
-
-
 def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Tuple[int, pd.DataFrame] | None:
     """
-    Lädt genau EIN RowGroup/Batch (ab start_rowgroup), normalisiert & sortiert nach __pickup_ts.
-    Gibt (next_rowgroup_index, df_sorted) zurück oder None wenn keine RowGroups mehr.
+    Lädt genau EIN Batch (ab start_rowgroup), normalisiert & sortiert nach __pickup_ts.
+    Gibt (next_rowgroup_index, df_sorted) zurück oder None wenn keine Batches mehr.
     """
     pf = pq.ParquetFile(path)
-    # ParquetFile.iter_batches ignoriert rowgroups nicht direkt; wir nehmen hier iter_batches + Skip.
-    # Für stabile Performance lesen wir einfach 'BATCH_SIZE' Zeilen (unabhängig von RowGroups).
-    # -> Wir nutzen hier eine einfache Schleife mit .read_row_groups wäre exakter, aber pyarrow high-level reicht.
-    # Wir simulieren "ab start_rowgroup" über einen Zähler:
     read = 0
-    rows_accum = 0
     dfs: List[pd.DataFrame] = []
     for batch in pf.iter_batches(batch_size=BATCH_SIZE):
         if read < start_rowgroup:
@@ -197,20 +172,17 @@ def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Tuple[in
         df = batch.to_pandas()
         df["service_type"] = service
         df = normalize_datetimes_to_string(df)
-        df = normalize_trip_type(df)   # <— HINZU
-        df = add_pickup_column(df)              # __pickup_ts / __pickup_day
+        df = normalize_trip_type(df)
+        df = add_pickup_column(df)  # __pickup_ts
         dfs.append(df)
-        rows_accum += len(df)
         read += 1
-        break  # nur 1 "Batch" (ein Stück) laden
+        break  # nur 1 Batch laden
 
     if not dfs:
         return None
 
     df_all = pd.concat(dfs, ignore_index=True)
     df_all.sort_values("__pickup_ts", inplace=True)
-    # fürs Senden __pickup_day nicht nötig
-    df_all.drop(columns=["__pickup_day"], inplace=True)
     return (read, df_all)
 
 def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | None) -> Iterator[dict]:
@@ -218,22 +190,18 @@ def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | Non
     Liefert Records aus (yellow, green) global chronologisch.
     Nutzt pro Service bis zu PRELOAD_BATCHES parallele, sortierte Teil-DataFrames.
     """
-    # pro Service: Pointer auf nächsten zu ladenden "Batch-Index" und eine Liste geladener DataFrames + Positionszeiger
     services = {
-        "yellow": {"path": y_path, "next_idx": 0, "buffers": []},  # buffers: List[dict(index:int, df:DataFrame)]
+        "yellow": {"path": y_path, "next_idx": 0, "buffers": []},
         "green":  {"path": g_path, "next_idx": 0, "buffers": []},
     }
 
-    # Min-Heap über alle aktuellen Zeilenköpfe: (timestamp, service_key, buf_idx, row_pos)
     heap: List[Tuple[pd.Timestamp, str, int, int]] = []
 
     def preload(service_key: str):
-        """Lädt bis PRELOAD_BATCHES Batches in den Puffer und pusht deren erstes Element in den Heap."""
         svc = services[service_key]
         pth = svc["path"]
         if pth is None:
             return
-        # Nachladen bis Limit erreicht oder keine Batches mehr
         while len(svc["buffers"]) < PRELOAD_BATCHES:
             nxt = load_sorted_batch(pth, service_key, svc["next_idx"])
             if nxt is None:
@@ -246,7 +214,6 @@ def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | Non
             ts0 = pd.to_datetime(df_sorted.iloc[0]["__pickup_ts"])
             heapq.heappush(heap, (ts0, service_key, buf_idx, 0))
 
-    # initiales Preload beider Services
     preload("yellow")
     preload("green")
 
@@ -255,24 +222,17 @@ def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | Non
         buf = services[skey]["buffers"][bidx]
         df = buf["df"]
         row = df.iloc[pos].to_dict()
-        # Entferne helper-Spalten, behalte Originale (tpep/lpep bleiben als Strings – ok)
         row.pop("__pickup_ts", None)
         yield row
 
-        # nächsten Zeiger im selben Buffer
         pos += 1
         if pos < len(df):
-            # push nächste Zeile aus demselben Buffer
             nxt_ts = pd.to_datetime(df.iloc[pos]["__pickup_ts"])
             heapq.heappush(heap, (nxt_ts, skey, bidx, pos))
-            # Update Position
             buf["pos"] = pos
         else:
-            # Buffer ist leer -> entfernen & ggf. neuen Batch preladen
-            services[skey]["buffers"][bidx] = None  # mark as None
-            # Speicher aufräumen: alte None-Einträge weg
+            services[skey]["buffers"][bidx] = None
             services[skey]["buffers"] = [b for b in services[skey]["buffers"] if b is not None]
-            # Neue Batches nachladen (hält PRELOAD_BATCHES)
             preload(skey)
 
 def stream_month_pair_chronological(y_file: Path | None, g_file: Path | None,
@@ -307,9 +267,7 @@ def stream_month_pair_chronological(y_file: Path | None, g_file: Path | None,
 
 def stream_single_file(path: Path, service: str, topic: str, rate: int, producer: Producer):
     """Fallback: eine Datei allein, chronologisch innerhalb der Datei (batchweise sortiert)."""
-    yield from (stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, DAY_GAP_SEC, producer),)
-
-# --- NEU: main() – älteste Monate, pro Monat y+g zusammenführen ---
+    yield from (stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, producer),)
 
 def main():
     ensure_topics(BOOTSTRAP, [TOPIC_Y, TOPIC_G])
@@ -317,12 +275,10 @@ def main():
     if not files:
         raise SystemExit(f"Keine Parquet-Dateien in {DATA_DIR} gefunden.")
 
-    # Map je (year,month) -> Pfade
     by_ym: dict[Tuple[int,int], dict[str,Path]] = {}
     for y, m, svc, p in files:
         by_ym.setdefault((y, m), {})[svc] = p
 
-    # Ältestes zuerst
     months_sorted = sorted(by_ym.keys())
 
     print("Sende chronologisch pro Monat (yellow+green gemerged, falls beide vorhanden):")
@@ -346,8 +302,6 @@ def main():
         stream_month_pair_chronological(y_file, g_file, prod_y, prod_g, RATE_MSGS_PER_SEC)
 
     print("Fertig: alle Monate verarbeitet.")
-
-
 
 if __name__ == "__main__":
     main()

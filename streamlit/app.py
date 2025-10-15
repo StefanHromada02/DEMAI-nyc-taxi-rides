@@ -15,7 +15,7 @@ st.title("End-to-End: Kafka → Spark → Postgres → Streamlit")
 
 # -------------------- Config --------------------
 DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://nyc:nyc@postgres:5432/nyc")
-REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))
+REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))  # festes Intervall (kein UI)
 
 @st.cache_resource
 def get_engine():
