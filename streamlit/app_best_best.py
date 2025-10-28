@@ -1,10 +1,10 @@
-# app.py — Event-driven Live-Uhr (jede NOTIFY = ein Schritt, robust & ruhig)
-# Zeigt die pickup_datetime GENAU des Datensatzes aus der NOTIFY-Payload (table/service + id).
-# Fallback bei Leerlauf: neuester per ingested_at. Nur bei Events wird neu gerendert.
+# app.py — Event-driven Live-Uhr (jede NOTIFY = ein Schritt, robustes Service-Mapping)
+# Zeigt die pickup_datetime GENAU des Datensatzes aus der NOTIFY (table/service + id).
+# Fallback bei Leerlauf: neuester per ingested_at. Re-Run nur bei echten Events.
 
 import os
 import json
-import time
+import re
 import select
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -35,12 +35,14 @@ def _fmt(ts, tz="UTC"):
 
 def _normalize_table_name(raw: str) -> str:
     """
-    Akzeptiert: 'rides_yellow', 'public.rides_yellow', 'yellow' (dito für green)
-    Liefert:   'rides_yellow' oder 'rides_green'
+    Akzeptiert z.B.:
+      'rides_yellow', 'public.rides_yellow', 'yellow'
+      'rides_green',  'public.rides_green',  'green'
+    Liefert: 'rides_yellow' / 'rides_green' oder '' wenn unklar
     """
     if not raw:
         return ""
-    t = raw.lower().strip()
+    t = str(raw).lower().strip()
     if "." in t:
         t = t.split(".")[-1]
     if t in ("yellow", "rides_yellow"):
@@ -49,15 +51,35 @@ def _normalize_table_name(raw: str) -> str:
         return "rides_green"
     return ""
 
-def _normalize_service(raw: str) -> str:
-    if not raw:
-        return ""
-    t = raw.lower().strip()
-    if t in ("yellow", "rides_yellow", "public.rides_yellow"):
-        return "yellow"
-    if t in ("green", "rides_green", "public.rides_green"):
-        return "green"
-    return ""
+def _parse_payload(txt: str) -> tuple[str, int | None, str]:
+    """
+    Versucht, aus der Payload (JSON ODER Freitext) Tabelle/Service und ID zu extrahieren.
+    Rückgabe: (parsed_table_norm | '', parsed_id | None, debug_reason)
+    """
+    if not txt:
+        return "", None, "empty"
+    # 1) JSON versuchen
+    try:
+        obj = json.loads(txt)
+        # Tolerant bei Keys: table/tbl/rel, service_type/service
+        cand_tbl = obj.get("table") or obj.get("tbl") or obj.get("rel") or obj.get("relation")
+        cand_srv = obj.get("service_type") or obj.get("service")
+        cand_id  = obj.get("id") or obj.get("pk") or obj.get("row_id")
+        tbl_norm = _normalize_table_name(cand_tbl or cand_srv or "")
+        if tbl_norm or cand_id is not None:
+            return tbl_norm, (int(cand_id) if cand_id is not None else None), "json"
+    except Exception:
+        pass
+    # 2) Freitext: nach green/yellow und Zahlen-ID suchen
+    low = txt.lower()
+    tbl_norm = ""
+    if "green" in low or "rides_green" in low:
+        tbl_norm = "rides_green"
+    elif "yellow" in low or "rides_yellow" in low:
+        tbl_norm = "rides_yellow"
+    m = re.search(r'"?id"?\s*[:=]\s*(\d+)', low) or re.search(r'\b(\d{1,12})\b', low)
+    cand_id = int(m.group(1)) if m else None
+    return tbl_norm, cand_id, "heuristic"
 
 # ================= Settings =================
 
@@ -73,14 +95,7 @@ WAIT_TIMEOUT_SEC = int(os.getenv("WAIT_TIMEOUT_SEC", "60"))
 
 @st.cache_resource
 def get_engine():
-    # Kurzes statement_timeout & pre_ping sorgen für Stabilität
-    return create_engine(
-        DB_URL,
-        pool_size=2,
-        max_overflow=0,
-        pool_pre_ping=True,
-        connect_args={"options": "-c statement_timeout=5000"}  # 5s
-    )
+    return create_engine(DB_URL, pool_size=2, max_overflow=0)
 
 def _pg_connect():
     return psycopg2.connect(
@@ -101,7 +116,6 @@ engine = get_engine()
 listen_conn = get_listen_conn()
 
 def _relisten():
-    """Neu verbinden & LISTEN neu setzen (ohne sofortigen Rerun)."""
     global listen_conn
     try:
         listen_conn.close()
@@ -111,14 +125,6 @@ def _relisten():
     listen_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     with listen_conn.cursor() as cur:
         cur.execute(f"LISTEN {LISTEN_CHANNEL};")
-
-def _relisten_with_backoff():
-    for delay in (0.5, 1, 2, 5):
-        try:
-            _relisten()
-            return
-        except Exception:
-            time.sleep(delay)
 
 # ================= Queries =================
 
@@ -159,11 +165,49 @@ ORDER BY ingested_at DESC, id DESC
 LIMIT 1;
 """)
 
-def fetch_by_id(table: str, row_id: int) -> pd.DataFrame:
-    if table not in SQL_BY_ID:
-        return pd.DataFrame()
+def _query_one(table_key: str, row_id: int) -> pd.DataFrame:
     with engine.begin() as conn:
-        return pd.read_sql(SQL_BY_ID[table], conn, params={"id": int(row_id)})
+        return pd.read_sql(SQL_BY_ID[table_key], conn, params={"id": int(row_id)})
+
+def _query_both_and_choose(row_id: int) -> tuple[pd.DataFrame, str]:
+    """
+    Holt dieselbe id aus beiden Tabellen und nimmt die mit der neueren ingested_at.
+    (Falls nur eine existiert, wird die genommen.)
+    """
+    df_y = _query_one("rides_yellow", row_id)
+    df_g = _query_one("rides_green", row_id)
+    if df_y.empty and df_g.empty:
+        return pd.DataFrame(), ""
+    if df_y.empty:
+        return df_g, "rides_green"
+    if df_g.empty:
+        return df_y, "rides_yellow"
+    # beide da -> neuere ingested_at gewinnt
+    iy = pd.to_datetime(df_y.iloc[0]["ingested_at"])
+    ig = pd.to_datetime(df_g.iloc[0]["ingested_at"])
+    return (df_y, "rides_yellow") if iy >= ig else (df_g, "rides_green")
+
+def fetch_by_event(payload_text: str) -> tuple[pd.DataFrame, str, str, str, int | None]:
+    """
+    Lädt den Datensatz passend zum Event.
+    Rückgabe: (df, payload_table_norm, parsed_from, resolved_table_used, parsed_id)
+    """
+    tbl_norm, rid, parsed_from = _parse_payload(payload_text)
+    if rid is None:
+        return pd.DataFrame(), tbl_norm, parsed_from, "", None
+    if tbl_norm in SQL_BY_ID:
+        df = _query_one(tbl_norm, rid)
+        if not df.empty:
+            return df, tbl_norm, parsed_from, tbl_norm, rid
+        # Fallback: andere Tabelle probieren
+        other = "rides_green" if tbl_norm == "rides_yellow" else "rides_yellow"
+        df2 = _query_one(other, rid)
+        if not df2.empty:
+            return df2, tbl_norm, parsed_from, other, rid
+        return pd.DataFrame(), tbl_norm, parsed_from, "", rid
+    # Unklar → beide probieren und anhand ingested_at entscheiden
+    df, resolved = _query_both_and_choose(rid)
+    return df, tbl_norm, parsed_from, resolved, rid
 
 def fetch_latest_row() -> pd.DataFrame:
     with engine.begin() as conn:
@@ -172,8 +216,7 @@ def fetch_latest_row() -> pd.DataFrame:
 # ================= Event-State =================
 
 if "event_queue" not in st.session_state:
-    # Queue-Items: {"table": "rides_green", "id": 12345}
-    st.session_state.event_queue = []
+    st.session_state.event_queue = []  # [{'payload': '<raw text>'}, ...]
 if "last_event_utc" not in st.session_state:
     st.session_state.last_event_utc = None
 if "debug_last_payloads" not in st.session_state:
@@ -184,56 +227,42 @@ def _append_notifications_to_queue():
     try:
         listen_conn.poll()
     except Exception:
-        _relisten_with_backoff()
+        _relisten()
         return
-
     while listen_conn.notifies:
         note = listen_conn.notifies.pop(0)
         payload_txt = note.payload or ""
         st.session_state.debug_last_payloads = (
             (st.session_state.debug_last_payloads + [payload_txt])[-10:]
         )
-
-        # JSON-parsen (erwartet von Trigger)
-        table_norm = ""
-        row_id = None
-        try:
-            payload = json.loads(payload_txt)
-            # bevorzugt service_type → eindeutig
-            service = _normalize_service(payload.get("service_type", ""))
-            if service:
-                table_norm = "rides_green" if service == "green" else "rides_yellow"
-            else:
-                table_norm = _normalize_table_name(payload.get("table", ""))
-            row_id = payload.get("id")
-        except Exception:
-            # Fallback: ignorieren (keine Events ohne ID/Tabelle)
-            payload = {}
-
-        if table_norm and row_id is not None:
-            st.session_state.event_queue.append({"table": table_norm, "id": int(row_id)})
-            st.session_state.last_event_utc = datetime.now(timezone.utc)
+        st.session_state.event_queue.append({"payload": payload_txt})
+        st.session_state.last_event_utc = datetime.now(timezone.utc)
 
 # ================= UI =================
 
 st.markdown("<h1 style='margin-bottom:0'>Live-Zeit (neuester DB-Eintrag)</h1>", unsafe_allow_html=True)
 
-# 1) Wenn Events in der Queue → erstes Event ziehen
+# 1) Event aus Queue ziehen (falls vorhanden)
 row_df = None
+payload_tbl_norm = ""
+parsed_from = ""
+resolved_tbl = ""
+parsed_id = None
+
 if st.session_state.event_queue:
     ev = st.session_state.event_queue.pop(0)
-    row_df = fetch_by_id(ev["table"], ev["id"])
+    row_df, payload_tbl_norm, parsed_from, resolved_tbl, parsed_id = fetch_by_event(ev["payload"])
 else:
-    # 2) Prüfen, ob bereits Notifications im Socket liegen → ggf. in Queue und sofort nutzen
     _append_notifications_to_queue()
     if st.session_state.event_queue:
         ev = st.session_state.event_queue.pop(0)
-        row_df = fetch_by_id(ev["table"], ev["id"])
+        row_df, payload_tbl_norm, parsed_from, resolved_tbl, parsed_id = fetch_by_event(ev["payload"])
 
-# 3) Fallback (kein Event): neuester Datensatz per ingested_at
+# 2) Fallback (kein Event oder nichts gefunden): neuester Datensatz per ingested_at
+fallback_used = False
 if row_df is None or row_df.empty:
     row_df = fetch_latest_row()
-    ev = None  # damit Statusanzeige weiß, dass es ein Fallback war
+    fallback_used = True
 
 if row_df.empty:
     st.info("Noch keine Daten in rides_yellow / rides_green.")
@@ -253,28 +282,25 @@ else:
         """,
         unsafe_allow_html=True,
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         st.write("**Service**")
         st.write(srv.upper())
     with c2:
         st.write("**Row-ID**")
         st.write(str(int(r["id"])) if pd.notna(r["id"]) else "—")
-    with c3:
-        # Lag: wie weit sind wir hinter dem Ingest-Zeitpunkt?
-        if ing is not None:
-            lag_s = int((datetime.now(timezone.utc) - ing).total_seconds())
-            st.write("**Lag vs. Ingest**")
-            st.write(f"{lag_s}s")
-        else:
-            st.write("**Lag vs. Ingest**")
-            st.write("—")
 
-    # Statusleiste
     if st.session_state.last_event_utc:
         ago = datetime.now(timezone.utc) - st.session_state.last_event_utc
-        base = f"Letztes NOTIFY vor {int(ago.total_seconds())}s • Kanal „{LISTEN_CHANNEL}“"
-        st.caption(base)
+        status = f"Letztes NOTIFY vor {int(ago.total_seconds())}s • Kanal „{LISTEN_CHANNEL}“"
+        if not fallback_used:
+            status += (
+                f" • payload_table={payload_tbl_norm or '—'}"
+                f" • parsed={parsed_from or '—'}"
+                f" • resolved={resolved_tbl or '—'}"
+                f" • id={parsed_id if parsed_id is not None else '—'}"
+            )
+        st.caption(status)
 
     with st.expander("Details des neuesten Eintrags"):
         st.write({
@@ -299,17 +325,15 @@ st.caption(f"Event-Driven via LISTEN/NOTIFY auf „{LISTEN_CHANNEL}“ • Timeo
 
 # ================= Event-Wait (nur bei Events rerun) =================
 
-# a) Schon anliegende NOTIFYs → in Queue, ggf. sofort rerun
 _append_notifications_to_queue()
 if st.session_state.event_queue:
     st.cache_data.clear()
     _safe_rerun()
 
-# b) Blockierend warten – NUR bei echtem Event rerun, sonst Seite stehen lassen
 try:
     readable, _, _ = select.select([listen_conn], [], [], WAIT_TIMEOUT_SEC)
 except Exception:
-    _relisten_with_backoff()
+    _relisten()
     readable = []
 
 if readable:
@@ -317,4 +341,4 @@ if readable:
     if st.session_state.event_queue:
         st.cache_data.clear()
         _safe_rerun()
-# Kein Event (Timeout) -> KEIN rerun. Seite bleibt ruhig stehen.
+# Kein Event -> kein Rerun.

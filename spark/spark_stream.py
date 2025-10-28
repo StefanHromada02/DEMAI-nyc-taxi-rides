@@ -36,19 +36,18 @@ spark.conf.set("spark.sql.shuffle.partitions", str(SHUFFLE_PARTS))
 
 schema = StructType([
     StructField("service_type", StringType()),
+    # yellow
     StructField("tpep_pickup_datetime",  StringType()),
     StructField("tpep_dropoff_datetime", StringType()),
+    # green
     StructField("lpep_pickup_datetime",  StringType()),
     StructField("lpep_dropoff_datetime", StringType()),
+    # gemeinsam
     StructField("PULocationID", IntegerType()),
     StructField("DOLocationID", IntegerType()),
-    StructField("trip_distance", DoubleType()),
-    StructField("fare_amount",  DoubleType()),
-    StructField("tip_amount",   DoubleType()),
-    StructField("total_amount", DoubleType()),
-    StructField("VendorID", IntegerType()),
-    StructField("trip_type", IntegerType()),
     StructField("passenger_count", IntegerType()),
+    StructField("trip_type", IntegerType()),     # nur green sinnvoll, bleibt sonst null
+    StructField("payment_type", IntegerType()),  # NEU
 ])
 
 def read_topic(topic: str):
@@ -80,9 +79,6 @@ dropoff_ts_local = to_timestamp(dropoff_str, fmt)
 df = (raw
     .withColumn("pickup_datetime",  to_utc_timestamp(pickup_ts_local,  "America/New_York"))
     .withColumn("dropoff_datetime", to_utc_timestamp(dropoff_ts_local, "America/New_York"))
-    .withColumn("fare_amount",  spark_round(col("fare_amount"), 2))
-    .withColumn("tip_amount",   spark_round(col("tip_amount"), 2))
-    .withColumn("total_amount", spark_round(col("total_amount"), 2))
     .withColumn(
         "service_type",
         when(col("service_type").isNull(),
@@ -96,23 +92,21 @@ df = (raw
 # Ziel-DFs je Tabelle (Spalten müssen zum Ziel passen)
 df_yellow = (df.filter(col("service_type")=="yellow")
     .select(
-        "pickup_datetime", "dropoff_datetime", "trip_distance",
-        "fare_amount", "tip_amount", "total_amount",
+        "pickup_datetime", "dropoff_datetime",
         col("PULocationID").alias("pu_loc"),
         col("DOLocationID").alias("do_loc"),
-        col("VendorID").alias("vendor_id"),
-        "passenger_count"
+        "passenger_count",
+        "payment_type",
     ))
 
 df_green = (df.filter(col("service_type")=="green")
     .select(
-        "pickup_datetime", "dropoff_datetime", "trip_distance",
-        "fare_amount", "tip_amount", "total_amount",
+        "pickup_datetime", "dropoff_datetime",
         col("PULocationID").alias("pu_loc"),
         col("DOLocationID").alias("do_loc"),
-        col("VendorID").alias("vendor_id"),
+        "passenger_count",
         "trip_type",
-        "passenger_count"
+        "payment_type",
     ))
 
 # ----------------------- JDBC Props -----------------------
@@ -124,40 +118,29 @@ pg_props = {"user": PGUSR, "password": PGPW, "driver": "org.postgresql.Driver"}
 def compute_batch_stats(df_in: DataFrame, service_type: str, batch_id: int) -> DataFrame:
     dfb = df_in
 
-    # Rückwärtsläufer: dropoff < pickup
     inversed = dfb.filter(col("dropoff_datetime") < col("pickup_datetime")).count()
-
-    # Null-Zeitstempel
     null_pickup  = dfb.filter(col("pickup_datetime").isNull()).count()
     null_dropoff = dfb.filter(col("dropoff_datetime").isNull()).count()
 
-    # Monotonie innerhalb des Micro-Batches (älteste zuerst)
+    from pyspark.sql.window import Window
     w = Window.orderBy(col("pickup_datetime").asc())
-    df_lag = dfb.select(
-        col("pickup_datetime"),
-        lag(col("pickup_datetime")).over(w).alias("prev_pickup")
-    )
-    equal_ts = df_lag.filter(col("prev_pickup").isNotNull() & (col("pickup_datetime") == col("prev_pickup"))).count()
+    equal_ts = (dfb.select(col("pickup_datetime"),
+                           lag(col("pickup_datetime")).over(w).alias("prev_pickup"))
+                  .filter(col("prev_pickup").isNotNull() & (col("pickup_datetime")==col("prev_pickup"))).count())
 
-    # Potentielle Duplikate im Batch (einfacher Hash über Kernfelder)
-    dedup_key_cols = [
-        "pickup_datetime","dropoff_datetime","trip_distance",
-        "fare_amount","tip_amount","total_amount",
-        "pu_loc","do_loc","vendor_id","passenger_count"
-    ]
-    df_key = (dfb
-        .withColumn("__key", sha2(concat_ws("||", *[col(c).cast("string") for c in dedup_key_cols]), 256)))
+    key_cols_common = ["pickup_datetime","dropoff_datetime","pu_loc","do_loc","passenger_count","payment_type"]
+    key_cols = key_cols_common + (["trip_type"] if service_type=="green" else [])
+    df_key = dfb.withColumn("__key", sha2(concat_ws("||", *[col(c).cast("string") for c in key_cols]), 256))
     dupes = (df_key.groupBy("__key").count()
              .filter(col("count") > 1)
-             .agg(spark_sum(col("count") - 1))
-             .collect())
+             .agg(spark_sum(col("count") - 1)).collect())
     dupes_count = int(dupes[0][0]) if dupes and dupes[0][0] is not None else 0
 
     rows_total = dfb.count()
     min_ts = dfb.agg(spark_min(col("pickup_datetime"))).collect()[0][0]
     max_ts = dfb.agg(spark_max(col("pickup_datetime"))).collect()[0][0]
 
-    stats_df = spark.createDataFrame(
+    return spark.createDataFrame(
         [(int(batch_id), service_type, rows_total, null_pickup, null_dropoff,
           inversed, equal_ts, dupes_count, min_ts, max_ts)],
         schema="""batch_id LONG, service_type STRING, rows_total LONG,
@@ -165,7 +148,7 @@ def compute_batch_stats(df_in: DataFrame, service_type: str, batch_id: int) -> D
                   rows_inversed LONG, rows_equal_ts LONG, rows_dupes LONG,
                   pickup_min TIMESTAMP, pickup_max TIMESTAMP"""
     )
-    return stats_df
+
 
 # ----------------------- Writer (Ordered + Stats) -----------------------
 

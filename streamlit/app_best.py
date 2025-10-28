@@ -1,10 +1,9 @@
-# app.py — Event-driven Live-Uhr (jede NOTIFY = ein Schritt, robust & ruhig)
-# Zeigt die pickup_datetime GENAU des Datensatzes aus der NOTIFY-Payload (table/service + id).
+# app.py — Event-driven Live-Uhr (jede NOTIFY = ein Schritt, kein Endlos-Rerun)
+# Zeigt die pickup_datetime GENAU des Datensatzes aus der NOTIFY-Payload (table + id).
 # Fallback bei Leerlauf: neuester per ingested_at. Nur bei Events wird neu gerendert.
 
 import os
 import json
-import time
 import select
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -49,16 +48,6 @@ def _normalize_table_name(raw: str) -> str:
         return "rides_green"
     return ""
 
-def _normalize_service(raw: str) -> str:
-    if not raw:
-        return ""
-    t = raw.lower().strip()
-    if t in ("yellow", "rides_yellow", "public.rides_yellow"):
-        return "yellow"
-    if t in ("green", "rides_green", "public.rides_green"):
-        return "green"
-    return ""
-
 # ================= Settings =================
 
 st.set_page_config(page_title="Taxi Livezeit (Event-Driven)", layout="wide")
@@ -73,14 +62,7 @@ WAIT_TIMEOUT_SEC = int(os.getenv("WAIT_TIMEOUT_SEC", "60"))
 
 @st.cache_resource
 def get_engine():
-    # Kurzes statement_timeout & pre_ping sorgen für Stabilität
-    return create_engine(
-        DB_URL,
-        pool_size=2,
-        max_overflow=0,
-        pool_pre_ping=True,
-        connect_args={"options": "-c statement_timeout=5000"}  # 5s
-    )
+    return create_engine(DB_URL, pool_size=2, max_overflow=0)
 
 def _pg_connect():
     return psycopg2.connect(
@@ -111,14 +93,6 @@ def _relisten():
     listen_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     with listen_conn.cursor() as cur:
         cur.execute(f"LISTEN {LISTEN_CHANNEL};")
-
-def _relisten_with_backoff():
-    for delay in (0.5, 1, 2, 5):
-        try:
-            _relisten()
-            return
-        except Exception:
-            time.sleep(delay)
 
 # ================= Queries =================
 
@@ -160,8 +134,6 @@ LIMIT 1;
 """)
 
 def fetch_by_id(table: str, row_id: int) -> pd.DataFrame:
-    if table not in SQL_BY_ID:
-        return pd.DataFrame()
     with engine.begin() as conn:
         return pd.read_sql(SQL_BY_ID[table], conn, params={"id": int(row_id)})
 
@@ -172,8 +144,7 @@ def fetch_latest_row() -> pd.DataFrame:
 # ================= Event-State =================
 
 if "event_queue" not in st.session_state:
-    # Queue-Items: {"table": "rides_green", "id": 12345}
-    st.session_state.event_queue = []
+    st.session_state.event_queue = []  # [{table:'rides_green', id:12345}, ...]
 if "last_event_utc" not in st.session_state:
     st.session_state.last_event_utc = None
 if "debug_last_payloads" not in st.session_state:
@@ -184,34 +155,22 @@ def _append_notifications_to_queue():
     try:
         listen_conn.poll()
     except Exception:
-        _relisten_with_backoff()
+        _relisten()
         return
-
     while listen_conn.notifies:
         note = listen_conn.notifies.pop(0)
         payload_txt = note.payload or ""
-        st.session_state.debug_last_payloads = (
-            (st.session_state.debug_last_payloads + [payload_txt])[-10:]
-        )
-
-        # JSON-parsen (erwartet von Trigger)
-        table_norm = ""
-        row_id = None
         try:
             payload = json.loads(payload_txt)
-            # bevorzugt service_type → eindeutig
-            service = _normalize_service(payload.get("service_type", ""))
-            if service:
-                table_norm = "rides_green" if service == "green" else "rides_yellow"
-            else:
-                table_norm = _normalize_table_name(payload.get("table", ""))
-            row_id = payload.get("id")
         except Exception:
-            # Fallback: ignorieren (keine Events ohne ID/Tabelle)
             payload = {}
-
-        if table_norm and row_id is not None:
-            st.session_state.event_queue.append({"table": table_norm, "id": int(row_id)})
+        st.session_state.debug_last_payloads = (
+            (st.session_state.debug_last_payloads + [payload_txt])[-5:]
+        )
+        tbl = _normalize_table_name(payload.get("table", ""))
+        rid = payload.get("id")
+        if tbl and rid is not None:
+            st.session_state.event_queue.append({"table": tbl, "id": int(rid)})
             st.session_state.last_event_utc = datetime.now(timezone.utc)
 
 # ================= UI =================
@@ -233,7 +192,6 @@ else:
 # 3) Fallback (kein Event): neuester Datensatz per ingested_at
 if row_df is None or row_df.empty:
     row_df = fetch_latest_row()
-    ev = None  # damit Statusanzeige weiß, dass es ein Fallback war
 
 if row_df.empty:
     st.info("Noch keine Daten in rides_yellow / rides_green.")
@@ -253,28 +211,17 @@ else:
         """,
         unsafe_allow_html=True,
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         st.write("**Service**")
         st.write(srv.upper())
     with c2:
         st.write("**Row-ID**")
         st.write(str(int(r["id"])) if pd.notna(r["id"]) else "—")
-    with c3:
-        # Lag: wie weit sind wir hinter dem Ingest-Zeitpunkt?
-        if ing is not None:
-            lag_s = int((datetime.now(timezone.utc) - ing).total_seconds())
-            st.write("**Lag vs. Ingest**")
-            st.write(f"{lag_s}s")
-        else:
-            st.write("**Lag vs. Ingest**")
-            st.write("—")
 
-    # Statusleiste
     if st.session_state.last_event_utc:
         ago = datetime.now(timezone.utc) - st.session_state.last_event_utc
-        base = f"Letztes NOTIFY vor {int(ago.total_seconds())}s • Kanal „{LISTEN_CHANNEL}“"
-        st.caption(base)
+        st.caption(f"Letztes NOTIFY vor {int(ago.total_seconds())}s • Kanal „{LISTEN_CHANNEL}“")
 
     with st.expander("Details des neuesten Eintrags"):
         st.write({
@@ -291,9 +238,6 @@ else:
             "ingested_at_utc": _fmt(ing, "UTC"),
         })
 
-with st.expander("Debug: letzte Payloads"):
-    st.code("\n".join(st.session_state.debug_last_payloads) or "—", language="json")
-
 st.markdown("<hr style='opacity:0.2'/>", unsafe_allow_html=True)
 st.caption(f"Event-Driven via LISTEN/NOTIFY auf „{LISTEN_CHANNEL}“ • Timeout {WAIT_TIMEOUT_SEC}s")
 
@@ -309,7 +253,7 @@ if st.session_state.event_queue:
 try:
     readable, _, _ = select.select([listen_conn], [], [], WAIT_TIMEOUT_SEC)
 except Exception:
-    _relisten_with_backoff()
+    _relisten()
     readable = []
 
 if readable:
