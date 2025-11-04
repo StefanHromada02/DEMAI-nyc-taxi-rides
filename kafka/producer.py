@@ -1,44 +1,55 @@
-import os, re, json, time
+import os, re, json, time, heapq
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Iterator, List, Dict, Optional
 
 import pandas as pd
 import pyarrow.parquet as pq
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
-from typing import Iterator, List, Dict
-import heapq
+# --------- Tunables (env) ---------
+BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "20000"))            # Arrow row-group batch
+PRELOAD_BATCHES  = int(os.getenv("PRELOAD_BATCHES", "2"))           # preloaded sorted buffers per service
+BOOTSTRAP        = os.getenv("BOOTSTRAP", "kafka:29092")
+TOPIC_Y          = os.getenv("TOPIC_Y", "taxi_yellow")
+TOPIC_G          = os.getenv("TOPIC_G", "taxi_green")
+DATA_DIR         = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[1] / "data" / "parquet"))
+RATE_MSGS_PER_SEC= int(os.getenv("RATE", "100"))                    # 0 = as fast as possible
+START_YEAR       = int(os.getenv("START_YEAR", "0"))                 # 0 = ignore
+KEY_STRATEGY     = os.getenv("KEY_STRATEGY", "none").lower()         # none|service|pickup_day
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20000"))
-PRELOAD_BATCHES = int(os.getenv("PRELOAD_BATCHES", "2"))  # wie viele Batches je Service gleichzeitig im Merge sein dürfen
-
-BOOTSTRAP   = os.getenv("BOOTSTRAP", "kafka:29092")
-TOPIC_Y     = os.getenv("TOPIC_Y", "taxi_yellow")
-TOPIC_G     = os.getenv("TOPIC_G", "taxi_green")
-DATA_DIR    = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[1] / "data" / "parquet"))
-
-# Livestream-Feeling: Nachrichten/Sekunde
-RATE_MSGS_PER_SEC = int(os.getenv("RATE", "100"))       # z.B. 100 = ~10ms Abstand
-
-# optional: ab Jahr starten (z.B. nur ab 2024)
-START_YEAR = int(os.getenv("START_YEAR", "0"))          # 0 = ignorieren
+# Send only what Spark actually reads (keeps payload tiny)
+Y_KEEP = [
+    "tpep_pickup_datetime", "tpep_dropoff_datetime",
+    "PULocationID", "DOLocationID",
+    "passenger_count", "payment_type"
+]
+G_KEEP = [
+    "lpep_pickup_datetime", "lpep_dropoff_datetime",
+    "PULocationID", "DOLocationID",
+    "passenger_count", "trip_type", "payment_type"
+]
 
 FILE_RE = re.compile(r"^(yellow|green)_tripdata_(\d{4})-(\d{2})\.parquet$", re.IGNORECASE)
+json_dumps = json.dumps  # micro-optim
 
 def create_producer() -> Producer:
+    # Small linger + zstd already good; acks=1 keeps CPU down on broker+client
+    # Avoid idempotence here (not needed for replayable offline seed; cheaper)
     return Producer({
         "bootstrap.servers": BOOTSTRAP,
         "linger.ms": 5,
-        "batch.size": 131072,            # ~128 KB
+        "batch.size": 131072,          # ~128 KiB per batch
         "compression.type": "zstd",
         "acks": "1",
         "enable.idempotence": False,
         "max.in.flight.requests.per.connection": 5,
         "message.timeout.ms": 30000,
+        # Slightly reduce client memory footprint
+        "queue.buffering.max.kbytes": 1024 * 64,   # 64 MiB
     })
 
-def ensure_topics(bootstrap: str, topics: list[str]) -> None:
+def ensure_topics(bootstrap: str, topics: List[str]) -> None:
     admin = AdminClient({"bootstrap.servers": bootstrap})
     existing = set(admin.list_topics(timeout=10).topics.keys())
     to_create = [NewTopic(t, num_partitions=1, replication_factor=1) for t in topics if t not in existing]
@@ -50,11 +61,8 @@ def ensure_topics(bootstrap: str, topics: list[str]) -> None:
             except Exception as e:
                 print(f"Topic create failed for {t}: {e}")
 
-def find_month_files(base: Path) -> list[Tuple[int,int,str,Path]]:
-    """
-    Scannt den Ordner und liefert (year, month, service, path) – nur valide Dateien.
-    """
-    out = []
+def find_month_files(base: Path) -> List[Tuple[int,int,str,Path]]:
+    out: List[Tuple[int,int,str,Path]] = []
     for p in base.glob("*.parquet"):
         m = FILE_RE.match(p.name)
         if not m:
@@ -63,60 +71,82 @@ def find_month_files(base: Path) -> list[Tuple[int,int,str,Path]]:
         if START_YEAR and y < START_YEAR:
             continue
         out.append((y, mth, service, p))
-    # Ältestes zuerst
+    # chronological with yellow before green for same (y,m)
     out.sort(key=lambda t: (t[0], t[1], 0 if t[2] == "yellow" else 1))
     return out
 
-def normalize_datetimes_to_string(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Konvertiert alle *_datetime-Spalten in ISO-Strings (Producer sendet Strings).
-    """
-    for c in df.columns:
-        lc = str(c).lower()
-        if "datetime" in lc or lc.endswith("_at"):
-            try:
-                ts = pd.to_datetime(df[c], errors="coerce", utc=False)
-                df[c] = ts.astype("datetime64[ns]").astype(str)
-            except Exception:
-                pass
+def _pickup_cols(service: str) -> Tuple[str, str]:
+    # Map service -> pickup, dropoff column names
+    if service == "yellow":
+        return "tpep_pickup_datetime", "tpep_dropoff_datetime"
+    return "lpep_pickup_datetime", "lpep_dropoff_datetime"
+
+def _keep_cols(service: str) -> List[str]:
+    return (Y_KEEP if service == "yellow" else G_KEEP)
+
+def _project_iter_batches(pf: pq.ParquetFile, service: str, batch_size: int):
+    # Project only needed columns directly at read-time (saves IO+RAM)
+    cols = _keep_cols(service)
+    for batch in pf.iter_batches(columns=cols, batch_size=batch_size):
+        yield batch
+
+def normalize_pick_drop(df: pd.DataFrame, service: str) -> pd.DataFrame:
+    # Touch only pickup/dropoff cols (don’t scan all *_datetime)
+    pcol, dcol = _pickup_cols(service)
+    df = df.copy()
+    if pcol in df.columns:
+        df[pcol] = pd.to_datetime(df[pcol], errors="coerce", utc=False).astype("datetime64[ns]").astype(str)
+    if dcol in df.columns:
+        df[dcol] = pd.to_datetime(df[dcol], errors="coerce", utc=False).astype("datetime64[ns]").astype(str)
     return df
 
-def add_pickup_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Vereinheitlicht Pickup-Zeitspalte.
-    Yellow: tpep_pickup_datetime, Green: lpep_pickup_datetime.
-    Fallback: pickup_datetime, pickup.
-    """
-    def pick(*names):
-        for n in names:
-            if n in df.columns:
-                return n
-        return None
+def normalize_trip_type(df: pd.DataFrame) -> pd.DataFrame:
+    if "trip_type" in df.columns:
+        df["trip_type"] = pd.to_numeric(df["trip_type"], errors="coerce").astype("Int64")
+    return df
 
-    col = pick("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime", "pickup")
-    if not col:
+def add_pickup_sort_key(df: pd.DataFrame, service: str) -> pd.DataFrame:
+    # Build __pickup_ts strictly from the relevant pickup col
+    pcol, _ = _pickup_cols(service)
+    if pcol not in df.columns:
         raise ValueError("Keine Pickup-Datetime-Spalte gefunden.")
     df = df.copy()
-    df["__pickup_ts"] = pd.to_datetime(df[col], errors="coerce", utc=False)
-    df = df.dropna(subset=["__pickup_ts"])
-    df = df.sort_values("__pickup_ts")
+    df["__pickup_ts"] = pd.to_datetime(df[pcol], errors="coerce", utc=False)
+    df = df.dropna(subset=["__pickup_ts"]).sort_values("__pickup_ts")
     return df
 
-def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate: int):
+def _make_key(rec: dict) -> Optional[bytes]:
+    # none: let Kafka round-robin across partitions → best utilization
+    # service: keep two keys (yellow/green) → 2 partitions hot
+    # pickup_day: spread by pickup date → moderate skew reduction without state
+    if KEY_STRATEGY == "none":
+        return None
+    if KEY_STRATEGY == "service":
+        return str(rec.get("service_type", "")).encode("utf-8")
+    if KEY_STRATEGY == "pickup_day":
+        # 2025-01-06 ... → “2025-01-06”
+        for k in ("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"):
+            v = rec.get(k)
+            if v:
+                return v[:10].encode("utf-8")
+    return None
+
+def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate: int) -> int:
+    # Rate-limited produce loop with gentle backpressure via poll()
     interval = None if rate <= 0 else 1.0 / rate
     next_tick = time.perf_counter()
     sent = 0
     for rec in records:
-        payload = json.dumps(rec, default=str).encode("utf-8")
+        payload = json_dumps(rec, default=str).encode("utf-8")
+        key = _make_key(rec)
         while True:
             try:
-                producer.produce(topic, value=payload, key=str(rec.get("service_type","")))
+                producer.produce(topic, value=payload, key=key)
                 break
             except BufferError:
-                producer.poll(0.05)
+                producer.poll(0.05)  # free internal queues
         sent += 1
         producer.poll(0)
-
         if interval is not None:
             next_tick += interval
             sleep = next_tick - time.perf_counter()
@@ -126,93 +156,63 @@ def drip_send_rows(producer: Producer, topic: str, records: Iterable[dict], rate
                 next_tick = time.perf_counter()
     return sent
 
-def normalize_trip_type(df: pd.DataFrame) -> pd.DataFrame:
-    if "trip_type" in df.columns:
-        df["trip_type"] = pd.to_numeric(df["trip_type"], errors="coerce").astype("Int64")
-    return df
-
-def stream_month_by_day(path: Path, service: str, topic: str, rate: int, producer: Producer):
-    """
-    Speicher-schonend: liest Parquet in Batches und sendet innerhalb jedes Batches
-    chronologisch nach __pickup_ts (keine Tages-Pausen mehr).
-    """
-    print(f"[{topic}] Lade (streaming) {path.name} …")
+def stream_month_file(path: Path, service: str, topic: str, rate: int, producer: Producer):
+    # Stream one file in chronological order, batch-by-batch, with column projection
+    print(f"[{topic}] streaming {path.name} …")
     pf = pq.ParquetFile(path)
     total_sent = 0
-
-    for batch in pf.iter_batches(batch_size=20_000):
+    for batch in _project_iter_batches(pf, service, batch_size=BATCH_SIZE):
         df = batch.to_pandas()
         df["service_type"] = service
-        df = normalize_datetimes_to_string(df)
-        df = normalize_trip_type(df)
-
-        # Pickup-Zeit vereinheitlichen + chronologisch sortieren
-        df = add_pickup_column(df)  # liefert __pickup_ts
-        records = df.drop(columns=["__pickup_ts"]).to_dict(orient="records")
-
-        sent = drip_send_rows(producer, topic, records, rate)
-        total_sent += sent
-        print(f"[{topic}] {path.name}: +{sent} (Σ {total_sent})")
-
+        df = normalize_trip_type(normalize_pick_drop(df, service))
+        df = add_pickup_sort_key(df, service)              # adds __pickup_ts & sorts
+        # Remove sort key and keep only allowed columns plus service_type
+        cols = set(_keep_cols(service)) | {"service_type"}
+        records = df.drop(columns=["__pickup_ts"]).loc[:, cols].to_dict(orient="records")
+        total_sent += drip_send_rows(producer, topic, records, rate)
+        print(f"[{topic}] {path.name}: Σ {total_sent}")
     producer.flush()
-    print(f"[{topic}] {path.name}: total {total_sent} gesendet (streaming).")
+    print(f"[{topic}] {path.name}: total {total_sent}")
 
-def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Tuple[int, pd.DataFrame] | None:
-    """
-    Lädt genau EIN Batch (ab start_rowgroup), normalisiert & sortiert nach __pickup_ts.
-    Gibt (next_rowgroup_index, df_sorted) zurück oder None wenn keine Batches mehr.
-    """
+def load_sorted_batch(path: Path, service: str, start_rowgroup: int) -> Optional[Tuple[int, pd.DataFrame]]:
+    # Used by the two-file merge; also projects columns early
     pf = pq.ParquetFile(path)
     read = 0
-    dfs: List[pd.DataFrame] = []
-    for batch in pf.iter_batches(batch_size=BATCH_SIZE):
+    for batch in _project_iter_batches(pf, service, batch_size=BATCH_SIZE):
         if read < start_rowgroup:
             read += 1
             continue
         df = batch.to_pandas()
         df["service_type"] = service
-        df = normalize_datetimes_to_string(df)
-        df = normalize_trip_type(df)
-        df = add_pickup_column(df)  # __pickup_ts
-        dfs.append(df)
-        read += 1
-        break  # nur 1 Batch laden
+        df = normalize_trip_type(normalize_pick_drop(df, service))
+        df = add_pickup_sort_key(df, service)
+        return (read + 1, df.sort_values("__pickup_ts"))
+    return None
 
-    if not dfs:
-        return None
-
-    df_all = pd.concat(dfs, ignore_index=True)
-    df_all.sort_values("__pickup_ts", inplace=True)
-    return (read, df_all)
-
-def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | None) -> Iterator[dict]:
-    """
-    Liefert Records aus (yellow, green) global chronologisch.
-    Nutzt pro Service bis zu PRELOAD_BATCHES parallele, sortierte Teil-DataFrames.
-    """
+def iter_records_chronological_two_files(y_path: Optional[Path], g_path: Optional[Path]) -> Iterator[dict]:
+    # Merge-iterator over yellow+green in global chronological order:
     services = {
         "yellow": {"path": y_path, "next_idx": 0, "buffers": []},
         "green":  {"path": g_path, "next_idx": 0, "buffers": []},
     }
-
     heap: List[Tuple[pd.Timestamp, str, int, int]] = []
 
-    def preload(service_key: str):
-        svc = services[service_key]
+    def preload(skey: str):
+        svc = services[skey]
         pth = svc["path"]
         if pth is None:
             return
         while len(svc["buffers"]) < PRELOAD_BATCHES:
-            nxt = load_sorted_batch(pth, service_key, svc["next_idx"])
+            nxt = load_sorted_batch(pth, skey, svc["next_idx"])
             if nxt is None:
                 break
             svc["next_idx"], df_sorted = nxt
             if df_sorted.empty:
                 continue
-            buf_idx = len(svc["buffers"])
+            bidx = len(svc["buffers"])
             svc["buffers"].append({"df": df_sorted, "pos": 0})
             ts0 = pd.to_datetime(df_sorted.iloc[0]["__pickup_ts"])
-            heapq.heappush(heap, (ts0, service_key, buf_idx, 0))
+            heapq.heappush(heap, (ts0, skey, bidx, 0))
 
     preload("yellow")
     preload("green")
@@ -224,7 +224,6 @@ def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | Non
         row = df.iloc[pos].to_dict()
         row.pop("__pickup_ts", None)
         yield row
-
         pos += 1
         if pos < len(df):
             nxt_ts = pd.to_datetime(df.iloc[pos]["__pickup_ts"])
@@ -235,27 +234,18 @@ def iter_records_chronological_two_files(y_path: Path | None, g_path: Path | Non
             services[skey]["buffers"] = [b for b in services[skey]["buffers"] if b is not None]
             preload(skey)
 
-def stream_month_pair_chronological(y_file: Path | None, g_file: Path | None,
-                                    prod_y: Producer, prod_g: Producer,
-                                    rate: int):
-    """
-    Sendet einen Monats-Slot: wenn y & g vorhanden -> interleaved chrono;
-    sonst die vorhandene Datei allein.
-    """
+def stream_month_pair_chronological(y_file: Optional[Path], g_file: Optional[Path],
+                                    prod_y: Producer, prod_g: Producer, rate: int):
+    # If both exist: interleave chronologically; otherwise stream single file
     if y_file is None and g_file is None:
         return
     if y_file is None:
-        # nur green
-        for _ in stream_single_file(g_file, "green", TOPIC_G, rate, prod_g):
-            pass
+        stream_month_file(g_file, "green", TOPIC_G, rate, prod_g)
         return
     if g_file is None:
-        # nur yellow
-        for _ in stream_single_file(y_file, "yellow", TOPIC_Y, rate, prod_y):
-            pass
+        stream_month_file(y_file, "yellow", TOPIC_Y, rate, prod_y)
         return
 
-    # beide vorhanden: global chrono
     sent_y = sent_g = 0
     for rec in iter_records_chronological_two_files(y_file, g_file):
         if rec.get("service_type") == "yellow":
@@ -265,17 +255,13 @@ def stream_month_pair_chronological(y_file: Path | None, g_file: Path | None,
     prod_y.flush(); prod_g.flush()
     print(f"[merge] {y_file.name} + {g_file.name} → sent yellow={sent_y}, green={sent_g}")
 
-def stream_single_file(path: Path, service: str, topic: str, rate: int, producer: Producer):
-    """Fallback: eine Datei allein, chronologisch innerhalb der Datei (batchweise sortiert)."""
-    yield from (stream_month_by_day(path, service, topic, RATE_MSGS_PER_SEC, producer),)
-
 def main():
     ensure_topics(BOOTSTRAP, [TOPIC_Y, TOPIC_G])
     files = find_month_files(DATA_DIR)
     if not files:
         raise SystemExit(f"Keine Parquet-Dateien in {DATA_DIR} gefunden.")
 
-    by_ym: dict[Tuple[int,int], dict[str,Path]] = {}
+    by_ym: Dict[Tuple[int,int], Dict[str,Path]] = {}
     for y, m, svc, p in files:
         by_ym.setdefault((y, m), {})[svc] = p
 

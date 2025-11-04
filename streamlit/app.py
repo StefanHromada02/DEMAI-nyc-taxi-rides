@@ -16,6 +16,7 @@ import psycopg2
 
 # ================= Helpers =================
 
+
 def _safe_rerun():
     try:
         st.rerun()
@@ -215,6 +216,48 @@ def _append_notifications_to_queue():
             st.session_state.last_event_utc = datetime.now(timezone.utc)
 
 # ================= UI =================
+
+
+with st.sidebar:
+    st.header("Explorer")
+    exp_hours = st.slider("Zeitraum (Stunden rückwärts)", 1, 48, 6)
+    exp_services = st.multiselect("Service", ["yellow", "green"], default=["yellow", "green"])
+    if not exp_services:
+        exp_services = ["yellow", "green"]
+
+end_utc = datetime.now(timezone.utc)
+start_utc = end_utc - pd.Timedelta(hours=exp_hours)
+
+def _timeseries(start_ts, end_ts, services):
+    qs = []
+    params = {"a": start_ts, "b": end_ts}
+    if "yellow" in services:
+        qs.append("""
+            SELECT date_trunc('hour', pickup_datetime) AS ts, 'yellow' AS svc, COUNT(*) AS n
+            FROM public.rides_yellow
+            WHERE pickup_datetime BETWEEN :a AND :b
+            GROUP BY 1
+        """)
+    if "green" in services:
+        qs.append("""
+            SELECT date_trunc('hour', pickup_datetime) AS ts, 'green' AS svc, COUNT(*) AS n
+            FROM public.rides_green
+            WHERE pickup_datetime BETWEEN :a AND :b
+            GROUP BY 1
+        """)
+    if not qs:
+        return pd.DataFrame(columns=["ts","svc","n"])
+    sql = " UNION ALL ".join(qs) + " ORDER BY 1,2"
+    with engine.begin() as c:
+        return pd.read_sql(text(sql), c, params=params)
+
+ts_df = _timeseries(start_utc, end_utc, exp_services)
+st.subheader("Fahrten pro Stunde (Kurz-Explorer)")
+if ts_df.empty:
+    st.info("Keine Daten im gewählten Zeitraum/Filter.")
+else:
+    piv = ts_df.pivot(index="ts", columns="svc", values="n").fillna(0).sort_index()
+    st.line_chart(piv, width="stretch")
 
 st.markdown("<h1 style='margin-bottom:0'>Live-Zeit (neuester DB-Eintrag)</h1>", unsafe_allow_html=True)
 
